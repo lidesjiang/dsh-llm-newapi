@@ -33,11 +33,14 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { serializeRequest } from './serialize.ts'
+import { serializeResponsesRequest } from './serialize.ts'
 import { parseSse } from './sse.ts'
 import { translate } from './translate.ts'
+import { translateResponses } from './translate.ts'
 import type {
   ModelsDevApi,
   ModelsDevMatch,
@@ -84,6 +87,8 @@ export interface NewApiCatalogModel {
    * {@link reasoningEfforts}. Absence defaults to the highest declared rung.
    */
   defaultReasoningEffort?: string
+  /** Explicit image-input support; `true` declares `['text','image']` modalities so the harness keeps image content for this model. Absent means text-only. */
+  vision?: boolean
 }
 
 /**
@@ -93,14 +98,25 @@ export interface NewApiCatalogModel {
  * makes a configuration change reach the next request without re-registration.
  */
 export interface NewApiConnectionOptions {
-  /** Gateway base including the `/v1` prefix; `/chat/completions` and `/models` are appended. */
+  /** Provider route id this connection serves (the group's route). */
+  provider: string
+  /** Human-readable group name shown in selectors. */
+  displayName: string
+  /**
+   * Wire protocol for this group: `chat` (default) hits
+   * `POST {baseURL}/chat/completions`; `responses` hits
+   * `POST {baseURL}/responses` (the OpenAI Responses API shape, for agents /
+   * multi-step output / tool calling).
+   */
+  apiType?: 'chat' | 'responses'
+  /** Gateway base including the `/v1` prefix; `/chat/completions`, `/responses`, and `/models` are appended. */
   baseURL: string
   /**
    * Credential reference of this same resolution, resolved per request.
    * Travelling with the endpoint is the point: a request can never pair one
    * generation's URL with another generation's secret. The reference is the
-   * fixed id `newapi` — the web settings page owns the value, and a literal
-   * key is not a configuration value.
+   * group's `newapi-<group>` ref — the web settings page owns the value, and a
+   * literal key is not a configuration value.
    */
   apiKeyRef: CredentialRef
   /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
@@ -131,8 +147,13 @@ export interface NewApiConnectionOptions {
 
 /** Constructor options for {@link NewApiAdapter}: the operation-local resolution hooks the plugin owns. */
 export interface NewApiAdapterOptions {
-  /** Current validated connection facts; called once per operation. */
-  options: () => NewApiConnectionOptions
+  /** Current validated connection facts for one provider route; called once per operation. */
+  options: (provider: string) => NewApiConnectionOptions
+  /**
+   * Provider route whose connection facts back an endpoint-less draft.
+   * Defaults to `newapi` when omitted (legacy single-gateway usage).
+   */
+  defaultProvider?: () => string
   /**
    * Resolve the bearer token for the connection facts of one request. The
    * snapshot is passed in — never re-read — so the key can only ever come
@@ -147,6 +168,14 @@ export interface NewApiAdapterOptions {
    * catalogs); absent when no route claims the id.
    */
   officialProviderOf?: (modelId: string) => Promise<string | undefined>
+  /**
+   * Resolve one durable image reference to request bytes, serving a vision
+   * catalog row. Wired by the plugin from `ctx.attachments`; absent on a
+   * deployment without the attachment service — then a vision row still
+   * declares image modalities, and the request serialization rejects image
+   * content explicitly instead of silently dropping it.
+   */
+  resolveImage?: (ref: ImageAttachmentRef, signal: AbortSignal) => Promise<StoredImageAttachment>
 }
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
@@ -174,13 +203,14 @@ function modelsDevMatch(provider: string, entry: ModelsDevModel): ModelsDevMatch
   const reasoningEfforts = entry.reasoning_options
     ?.filter(option => option?.type === 'effort')
     .flatMap(option => (option.values ?? []).filter((value): value is string => typeof value === 'string' && value.length > 0))
-  if (contextWindow === undefined && maxTokens === undefined) return undefined
+  const vision = entry.modalities?.input?.includes('image')
   return {
     provider,
     ...entry.name !== undefined && entry.name.length > 0 ? { name: entry.name } : {},
     ...contextWindow !== undefined ? { contextWindow } : {},
     ...maxTokens !== undefined ? { maxTokens } : {},
     ...reasoningEfforts !== undefined && reasoningEfforts.length > 0 ? { reasoningEfforts } : {},
+    ...vision === true ? { vision: true } : {},
   }
 }
 
@@ -298,7 +328,7 @@ function modelInfo(provider: string, model: NewApiCatalogModel): LlmModelInfo {
     id: model.id,
     name: model.name ?? model.id,
     ...model.description === undefined ? {} : { description: model.description },
-    inputModalities: ['text'],
+    inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
   }
 }
 
@@ -405,6 +435,11 @@ export function httpErrorCode(status: number, error?: WireError['error']): strin
   return `HTTP_${status}`
 }
 
+/** Base64 data URL for one stored image. */
+function imageDataUrl(image: StoredImageAttachment): string {
+  return `data:${image.ref.mediaType};base64,${Buffer.from(image.data).toString('base64')}`
+}
+
 /**
  * The NewAPI gateway adapter. One instance serves every model name it was
  * registered under (the harness model name IS the wire model name).
@@ -418,15 +453,18 @@ export class NewApiAdapter extends LlmAdapter {
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'NewAPI' }
+    const connection = this.config.options(provider)
+    // Fall back to 'NewAPI' for legacy/single-route constructions that omit a
+    // group display name; the harness requires a non-empty provider name.
+    return { id: provider, name: connection.displayName || 'NewAPI' }
   }
 
-  override providerRetryPolicy(_provider: string): ResolvedRetryPolicy {
-    return this.config.options().retryPolicy
+  override providerRetryPolicy(provider: string): ResolvedRetryPolicy {
+    return this.config.options(provider).retryPolicy
   }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
+    return Promise.resolve(this.config.options(provider).models.map(model => modelInfo(provider, model)))
   }
 
   override resolveModel(
@@ -434,14 +472,14 @@ export class NewApiAdapter extends LlmAdapter {
     model: string,
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    const connection = this.config.options()
+    const connection = this.config.options(provider)
     const configured = connection.models.find(entry => entry.id === model)
     const defaultMaxTokens = configured?.maxTokens ?? connection.maxTokens
     return Promise.resolve({
-      // The chat-completions wire route is text-only regardless of catalog
-      // membership, so the uncatalogued fallback declares the same negative
-      // capability — "unknown" here would let the host accept and persist
-      // images the serializer must then reject.
+      // The chat-completions wire route is text-only unless the catalog row
+      // explicitly declares vision — the uncatalogued fallback declares the
+      // same negative capability, so "unknown" can never let the host accept
+      // and persist images the serializer must then reject.
       ...configured === undefined
         ? { provider, id: model, name: model, inputModalities: ['text' as const] }
         : modelInfo(provider, configured),
@@ -481,8 +519,20 @@ export class NewApiAdapter extends LlmAdapter {
    * @returns the advertised models, deduplicated by the runtime, enriched
    *   with context/maxTokens facts from the configured catalog when ids match.
    */
+  /**
+   * The provider route backing an endpoint-less draft: the configured
+   * default, else the legacy `newapi` route.
+   */
+  private defaultProviderRoute(): string {
+    return this.config.defaultProvider?.() ?? 'newapi'
+  }
+
   async discoverModels(request: LlmModelDiscoveryRequest): Promise<readonly LlmDiscoveredModel[]> {
-    const connection = this.config.options()
+    // The draft names the route it edits, if any; the connection snapshot for
+    // that route supplies the fallback facts (exclude patterns, catalog).
+    const connection = request.provider !== undefined
+      ? this.config.options(request.provider)
+      : this.config.options(this.defaultProviderRoute())
     const base = request.baseURL !== undefined && request.baseURL.length > 0
       ? normalizeBaseUrl(request.baseURL)
       : connection.baseURL
@@ -570,9 +620,10 @@ export class NewApiAdapter extends LlmAdapter {
   ): Promise<ModelsDevParamsResponse> {
     // The enabled-proxy setting travels with the connection snapshot; an
     // explicit per-request URL (the unsaved draft in the form) overrides it.
+    const providerRoute = request.provider ?? this.defaultProviderRoute()
     const proxyUrl = request.proxyUrl !== undefined && request.proxyUrl.length > 0
       ? request.proxyUrl
-      : this.config.options().proxyUrl
+      : this.config.options(providerRoute).proxyUrl
     const dispatcher = proxyUrl !== undefined
       ? new ProxyAgent(proxyUrl)
       : undefined
@@ -617,7 +668,7 @@ export class NewApiAdapter extends LlmAdapter {
     } finally {
       void dispatcher?.close().catch(() => {})
     }
-    const hints = this.config.options().providerHints
+    const hints = this.config.options(providerRoute).providerHints
     return {
       models: await Promise.all(request.modelIds.map(async id => ({
         id,
@@ -659,7 +710,7 @@ export class NewApiAdapter extends LlmAdapter {
     // never observes a configuration change and the next call re-resolves.
     // The key resolves *from this snapshot*, so an endpoint and the secret
     // sent to it can never come from different configuration generations.
-    const connection = this.config.options()
+    const connection = this.config.options(options.provider)
     const apiKey = await this.config.resolveApiKey(connection)
     const consumer = new AbortController()
     const upstream = options.signal === undefined
@@ -708,6 +759,35 @@ export class NewApiAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * Resolve every image block of a request to a data URL when the selected
+   * model is a vision catalog row and a resolver is wired. Missing resolver
+   * or text-only row returns `undefined` (text-only serialization).
+   * @param options - the request; `options.model` selects the catalog row.
+   * @param signal - caller cancellation for attachment reads.
+   * @param connection - the group's connection facts.
+   * @returns attachmentId → data URL, or `undefined` when no image support.
+   */
+  private async resolveRequestImages(
+    options: GenerateOptions,
+    signal: AbortSignal,
+    connection: NewApiConnectionOptions,
+  ): Promise<Map<string, string> | undefined> {
+    const resolver = this.config.resolveImage
+    if (resolver === undefined) return undefined
+    const configured = connection.models.find(entry => entry.id === options.model)
+    if (configured?.vision !== true) return undefined
+    const refs: ImageAttachmentRef[] = []
+    for (const message of options.messages) {
+      for (const block of message.content) {
+        if (block.type === 'image') refs.push(block.attachment)
+      }
+    }
+    if (refs.length === 0) return undefined
+    const resolved = await Promise.all(refs.map(ref => resolver(ref, signal)))
+    return new Map(resolved.map(image => [image.ref.attachmentId, imageDataUrl(image)]))
+  }
+
   private async * request(
     options: GenerateOptions,
     signal: AbortSignal,
@@ -715,7 +795,14 @@ export class NewApiAdapter extends LlmAdapter {
     apiKey: string,
     onComment: () => void,
   ): AsyncIterable<StreamChunk> {
-    const body = serializeRequest(options)
+    // Vision models (catalog rows declaring `vision`) may carry image blocks:
+    // resolve them to data URLs so the serializer can emit OpenAI content
+    // parts. Text-only rows and an absent resolver keep the text-only wire.
+    const images = await this.resolveRequestImages(options, signal, connection)
+    const responses = connection.apiType === 'responses'
+    const body = responses
+      ? serializeResponsesRequest(options, images)
+      : serializeRequest(options, images)
     // Prepared outside the try so the TRANSPORT label below covers exactly the
     // transport boundary, never a serialization failure.
     const payload = JSON.stringify(body)
@@ -730,7 +817,7 @@ export class NewApiAdapter extends LlmAdapter {
 
     let response: Response
     try {
-      response = await fetch(`${connection.baseURL}/chat/completions`, {
+      response = await fetch(`${connection.baseURL}${responses ? '/responses' : '/chat/completions'}`, {
         method: 'POST',
         headers,
         body: payload,
@@ -773,6 +860,8 @@ export class NewApiAdapter extends LlmAdapter {
       throw new LlmError('NewAPI returned no response body', 'EMPTY_RESPONSE')
     }
 
-    yield* translate(parseSse(response.body, onComment))
+    yield* responses
+      ? translateResponses(parseSse(response.body, onComment, false))
+      : translate(parseSse(response.body, onComment))
   }
 }

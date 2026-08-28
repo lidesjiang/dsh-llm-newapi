@@ -28,10 +28,20 @@ export interface WireSystemMessage {
     role: 'system';
     content: string;
 }
-/** User-role message: a single string of user input. */
+/** One content part of a multimodal user message. */
+export interface WireContentPart {
+    type: 'text' | 'image_url';
+    /** `type: 'text'` carries the text. */
+    text?: string;
+    /** `type: 'image_url'` carries the data URL. */
+    image_url?: {
+        url: string;
+    };
+}
+/** User-role message: a single string, or OpenAI content parts when images ride. */
 export interface WireUserMessage {
     role: 'user';
-    content: string;
+    content: string | WireContentPart[];
 }
 /** Tool-role message: the result of one tool call, keyed by its call id. */
 export interface WireToolMessage {
@@ -164,6 +174,102 @@ export interface WireModelEntry {
     /** OpenAI `owned_by` field when present. */
     owned_by?: string;
 }
+/** Request body for `POST {baseURL}/responses`. */
+export interface ResponsesRequest {
+    model: string;
+    input: ResponsesInputItem[];
+    stream: true;
+    stream_options: {
+        include_usage: true;
+    };
+    tools?: ResponsesTool[];
+    instructions?: string;
+    temperature?: number;
+    /** Output cap; `max_tokens` is a chat-completions spelling. */
+    max_output_tokens?: number;
+    /** Reasoning control; `reasoning_effort` is a chat-completions spelling. */
+    reasoning?: {
+        effort: string;
+    };
+}
+/** One `input` entry: a role message, a replayed tool call, or its result. */
+export type ResponsesInputItem = {
+    role: 'system' | 'developer' | 'user' | 'assistant';
+    content: string | ResponsesContentPart[];
+} | {
+    type: 'function_call';
+    call_id: string;
+    name: string;
+    arguments: string;
+} | {
+    type: 'function_call_output';
+    call_id: string;
+    output: string;
+};
+/** One content part of a role message (text, or a base64 data-URL image). */
+export interface ResponsesContentPart {
+    type: 'input_text' | 'input_image';
+    text?: string;
+    /** The image URL; data URLs carry base64 bytes inline. */
+    image_url?: string;
+}
+/** One entry of the `tools` array; `name` lives at the top level (unlike chat). */
+export interface ResponsesTool {
+    type: 'function';
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+}
+/** One streamed Responses-API event payload (the `data:` line). */
+export interface ResponsesEvent {
+    type?: string;
+    /** `response.output_item.added` / `.done`: the announced output item. */
+    item?: ResponsesOutputItem;
+    /** `output_text.delta` / `function_call_arguments.delta`: text fragment. */
+    delta?: string;
+    /** Which streamed output slot the event targets. */
+    output_index?: number;
+    /** `response.completed` / `incomplete` / `failed`: terminal state. */
+    response?: ResponsesResponse;
+    /** `error`: transport-level in-band failure. */
+    error?: {
+        message?: string;
+        code?: string;
+    };
+}
+/** One output item as announced by the stream. */
+export interface ResponsesOutputItem {
+    type?: string;
+    /** `function_call` calls carry both an item `id` and the wire `call_id`. */
+    id?: string;
+    call_id?: string;
+    name?: string;
+    /** JSON string; streamed fragment-wise, or whole on `.done`. */
+    arguments?: string;
+}
+/** Terminal response state (attached to `response.completed` etc.). */
+export interface ResponsesResponse {
+    status?: string;
+    error?: {
+        message?: string;
+        code?: string;
+    };
+    incomplete_details?: {
+        reason?: string;
+    };
+    usage?: ResponsesUsage;
+}
+/** Responses-API usage; `input_tokens` includes cache hits (subtract them). */
+export interface ResponsesUsage {
+    input_tokens: number;
+    output_tokens: number;
+    input_tokens_details?: {
+        cached_tokens?: number;
+    };
+    output_tokens_details?: {
+        reasoning_tokens?: number;
+    };
+}
 /** Root of `https://models.dev/api.json`: one entry per provider id. */
 export interface ModelsDevApi {
     [provider: string]: {
@@ -190,6 +296,11 @@ export interface ModelsDevModel {
         type: string;
         values?: Array<string | null>;
     }>;
+    /** Input/output modalities the model accepts; `image` marks vision models. */
+    modalities?: {
+        input?: string[];
+        output?: string[];
+    };
 }
 /** One models.dev provider match for a gateway model id. */
 export interface ModelsDevMatch {
@@ -205,9 +316,13 @@ export interface ModelsDevMatch {
     reasoningEfforts?: string[];
     /** True when this match's provider is the model's official vendor. */
     official?: boolean;
+    /** True when the catalog entry accepts image input (vision model). */
+    vision?: boolean;
 }
 /** Request payload of the `models-dev-params` RPC endpoint. */
 export interface ModelsDevParamsRequest {
+    /** Provider route whose group owns the hints and proxy fallback. */
+    provider?: string;
     /** Gateway model ids to look up, verbatim. */
     modelIds: string[];
     /** Forward-proxy URL to route the api.json download through, when enabled. */

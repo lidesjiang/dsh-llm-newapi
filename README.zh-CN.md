@@ -72,6 +72,9 @@ dsh plugin --profile web add link:$(pwd)
   name: dsh-llm-newapi
   config:
     baseURL: http://gw.local:3000/v1   # 含 /v1 前缀；缺省回退 env NEWAPI_BASE_URL → 占位符
+    # apiType: chat                    # 接口协议：'chat'（默认，走 POST {baseURL}/chat/completions）
+    #                                  或 'responses'（OpenAI Responses API，走 POST {baseURL}/responses，
+    #                                  适合 Agent / 多步输出 / 工具调用）
     # models:                          # 建议性目录；默认空，用「获取模型」拉取 /models
     #   - id: deepseek-chat
     #     contextWindow: 65536
@@ -114,6 +117,8 @@ npm run cache:models-dev      # 本地缓存 models.dev/api.json 到 .cache/（g
 改源码后须重跑 `npm run build` 并**提交 `lib/`**——`github:` 安装从提交的产物运行，CI 的「Committed artifacts are current」步骤会在产物过期时拒绝。
 
 ## 状态
+
+v0.9.0：每网关组可选接口协议——`chat`（默认，走 `POST {baseURL}/chat/completions`）或 `responses`（OpenAI Responses API，走 `POST {baseURL}/responses`，适合 Agent / 多步输出 / 工具调用）。responses 组按 Responses-API 形态序列化（`instructions`、role 消息 + `function_call` / `function_call_output` 输入项、`max_output_tokens`、`reasoning.effort`、工具 `name` 置顶），并把 Responses-API SSE 事件（`output_text.delta`、`output_item.added`、`function_call_arguments.delta`，以 `completed` / `incomplete` / `failed` 收尾）翻译成同一套 harness 流契约——`/responses` 流无需 `[DONE]` 哨兵。设置页：每组新增接口类型选择器，responses 组卡片头部带协议徽标。
 
 v0.8.3：tool-call id/name delta 加固（#1）——部分网关（glm-5.3 经 qcplay）在 tool-call 后续 delta 中把 `id`/`function.name` 以**空字符串**重复下发而非省略字段，原先「字段存在即覆盖」的合并把首段收到的真实工具名覆盖为空，所有工具调用统一报 `unknown tool`；翻译层现仅接受非空的 `id`/`name`（与 text/reasoning delta 已有的非空守卫一致），arguments 拼接不变。
 

@@ -4,23 +4,26 @@
  * and tool results become separate tool messages. Assistant reasoning is
  * replayed as `reasoning_content` only on tool-call turns, as required by
  * DeepSeek-family upstreams (other OpenAI-compatible upstreams ignore the
- * field). Core image blocks are rejected explicitly because this wire route
- * is text-only; unknown declaration-merged block types retain the adapter's
- * documented extension fallback. No reasoning-control fields are emitted:
- * the adapter declares no reasoning efforts, so callers cannot pass one.
+ * field). When the caller supplies resolved image data (a vision catalog
+ * row), user messages carry image blocks as OpenAI content parts; otherwise
+ * core image blocks are rejected explicitly because the text-only wire route
+ * cannot carry them. No reasoning-control fields are emitted unless the
+ * catalog declared efforts (then an explicit effort rides as
+ * `reasoning_effort`).
  * @module dsh-llm-newapi/serialize
  */
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm';
-import type { WireMessage, WireRequest } from './types.js';
+import type { ResponsesRequest, WireMessage, WireRequest } from './types.js';
 /**
  * Serialize the conversation. `tool-result` blocks become standalone
  * `{role: 'tool'}` messages; the harness puts each tool result in its own
  * user-role message, so a mixed user message contributes its text first and
  * its tool results as separate wire messages after.
  * @param messages - the harness conversation, in order.
+ * @param images - resolved attachmentId → data URL (vision models only).
  * @returns the wire messages; order preserved, each tool result expanded into its own entry.
  */
-export declare function serializeMessages(messages: Message[]): WireMessage[];
+export declare function serializeMessages(messages: Message[], images?: ReadonlyMap<string, string>): WireMessage[];
 /**
  * Build the full wire request. Always streaming (`stream: true`, usage
  * reporting on); optional fields are omitted rather than sent as null, so
@@ -29,6 +32,16 @@ export declare function serializeMessages(messages: Message[]): WireMessage[];
  * reasoning effort rides as OpenAI-compatible `reasoning_effort`; it only
  * ever arrives for a row whose catalog declares supported efforts.
  * @param options - the harness request (model, history, system, tools, sampling).
+ * @param images - resolved attachmentId → data URL (vision models only).
  * @returns the chat-completions request body.
  */
-export declare function serializeRequest(options: GenerateOptions): WireRequest;
+export declare function serializeRequest(options: GenerateOptions, images?: ReadonlyMap<string, string>): WireRequest;
+/**
+ * Build the wire request for the Responses API endpoint. The RPC shape maps
+ * harness concepts to the `input` array (role messages + function_call /
+ * function_call_output items), with `instructions` for the system prompt and
+ * `max_output_tokens` / `reasoning.effort` in place of chat-completions
+ * spellings. Assistant content-less turns (reasoning-only) are omitted — the
+ * wire has no reasoning passback field.
+ */
+export declare function serializeResponsesRequest(options: GenerateOptions, images?: ReadonlyMap<string, string>): ResponsesRequest;

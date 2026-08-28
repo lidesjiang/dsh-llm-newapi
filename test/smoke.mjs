@@ -498,6 +498,111 @@ function stubModelsListing() {
   assert.equal(chunks.at(-1).reason.kind, 'tool-calls')
 }
 
+// ── Block I: the Responses API group type ──
+// A group whose apiType is 'responses' serializes the OpenAI Responses-API
+// shape, posts to {baseURL}/responses, and translates Responses-API SSE
+// events (terminated by response.completed — no [DONE] sentinel) into the
+// same StreamChunk contract.
+{
+  // serializeResponsesRequest: instructions/input items/tools/max_output_tokens
+  // /reasoning.effort in place of the chat-completions spellings.
+  const wire = plugin.serializeResponsesRequest({
+    model: 'gpt-5',
+    system: 'be terse',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'what time is it?' }] },
+      { role: 'assistant', content: [
+        { type: 'text', text: '' },
+        { type: 'tool-call', id: 'call_1', name: 'get_time', arguments: '{}' },
+      ] },
+      { role: 'user', content: [
+        { type: 'text', text: '' },
+        { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '12:00' }] },
+      ] },
+    ],
+    tools: [{ name: 'get_time', description: 'current time', parameters: { type: 'object' } }],
+    maxTokens: 4096,
+    reasoningEffort: 'high',
+  })
+  assert.equal(wire.instructions, 'be terse')
+  assert.equal(wire.max_output_tokens, 4096)
+  assert.equal('max_tokens' in wire, false)
+  assert.deepEqual(wire.reasoning, { effort: 'high' })
+  assert.equal('reasoning_effort' in wire, false)
+  assert.deepEqual(wire.input[0], { role: 'user', content: 'what time is it?' })
+  // The empty-text assistant turn becomes its tool call only.
+  assert.deepEqual(wire.input[1], { type: 'function_call', call_id: 'call_1', name: 'get_time', arguments: '{}' })
+  assert.deepEqual(wire.input[2], { type: 'function_call_output', call_id: 'call_1', output: '12:00' })
+  // Responses-API tools carry name at the top level, not under function.
+  assert.deepEqual(wire.tools, [{ type: 'function', name: 'get_time', description: 'current time', parameters: { type: 'object' } }])
+
+  const adapter = new plugin.NewApiAdapter({
+    options: () => ({
+      provider: 'newapi',
+      apiType: 'responses',
+      baseURL: 'http://gw.local:3000/v1',
+      apiKeyRef: 'newapi',
+      models: [],
+      modelExcludePatterns: [],
+      defaultContextWindow: 128_000,
+      streamIdleTimeoutMs: 300_000,
+      retryPolicy: resolveRetryPolicy(undefined, 'smoke'),
+    }),
+    resolveApiKey: async () => 'smoke-key',
+  })
+
+  const sse = [
+    `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_time', arguments: '' } })}\n\n`,
+    `data: ${JSON.stringify({ type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"tz":"Asia/Shanghai"}' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'The time is ' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'now.' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 100, output_tokens: 50, input_tokens_details: { cached_tokens: 40 }, output_tokens_details: { reasoning_tokens: 5 } } } })}\n\n`,
+  ].join('')
+  const originalFetch = globalThis.fetch
+  const asked = { url: '' }
+  globalThis.fetch = async (url) => { asked.url = String(url); return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }) }
+  let chunks
+  try {
+    chunks = []
+    for await (const chunk of adapter.stream({ model: 'gpt-5', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) chunks.push(chunk)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  // The Responses-API endpoint, not chat completions.
+  assert.equal(asked.url, 'http://gw.local:3000/v1/responses')
+  const ended = chunks.filter(chunk => chunk.type === 'block-end')
+  assert.equal(ended.length, 2)
+  const text = ended.find(block => block.block.type === 'text')
+  const call = ended.find(block => block.block.type === 'tool-call')
+  assert.equal(text.block.text, 'The time is now.')
+  assert.equal(call.block.id, 'call_1')
+  assert.equal(call.block.name, 'get_time')
+  assert.equal(call.block.arguments, '{"tz":"Asia/Shanghai"}')
+  // Disjoint usage: cache reads subtracted, reasoning tokens reported.
+  assert.deepEqual(chunks.find(chunk => chunk.type === 'usage').usage, {
+    inputTokens: 60, outputTokens: 50, cacheReadTokens: 40, reasoningTokens: 5,
+  })
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+
+  // An in-band failure event degrades to an error finish.
+  const failedSse = [
+    `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'partial' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'response.failed', response: { error: { code: 'server_error', message: 'boom' } } })}\n\n`,
+  ].join('')
+  globalThis.fetch = async () => new Response(failedSse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  let failedChunks
+  try {
+    failedChunks = []
+    for await (const chunk of adapter.stream({ model: 'gpt-5', messages: [] })) failedChunks.push(chunk)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  const failure = failedChunks.at(-1).reason
+  assert.equal(failure.kind, 'error')
+  assert.equal(failure.failure.message, 'boom')
+  assert.equal(failure.failure.code, 'server_error')
+}
+
 // ── Block H (optional): real-catalog check against the local dev cache ──
 // .cache/models-dev.api.json (npm run cache:models-dev, gitignored) carries
 // the catalog's real field shapes; when present, matchModelsDev is exercised
@@ -522,4 +627,4 @@ function stubModelsListing() {
   }
 }
 
-console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, settings validation, ordering, display names, models.dev matching, deferred RPC channel, dead-proxy diagnostics, and empty-string tool-call delta hardening OK')
+console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, settings validation, ordering, display names, models.dev matching, deferred RPC channel, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')

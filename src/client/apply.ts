@@ -35,6 +35,7 @@ const NS = 'settings.newapi'
  * `.secondaryButton`).
  */
 const SECTION_CSS = `
+.newapi-intro { color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 20px; margin: 0 0 12px; }
 .newapi-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .newapi-input {
   box-sizing: border-box; padding: 6px 10px; border-radius: 8px;
@@ -62,6 +63,44 @@ const SECTION_CSS = `
 .newapi-button--primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
 .newapi-error { color: var(--dsw-alias-state-error-primary); }
 .newapi-hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+
+/* Gateway group cards: one bordered card per group, a header row with
+   name/route badge/status/count, and an expanding body. */
+.newapi-groups { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
+.newapi-group {
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+  padding: 10px 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.newapi-group-head {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0;
+}
+.newapi-group-toggle {
+  box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; flex: none;
+  border: none; border-radius: 6px;
+  background: transparent; color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+.newapi-group-toggle:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.newapi-group-name { flex: 1 1 auto; min-width: 0; font-weight: 600; }
+.newapi-badge {
+  flex: none; display: inline-flex; align-items: center;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font: inherit; font-size: 11px; line-height: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.newapi-statusdot { width: 8px; height: 8px; flex: none; border-radius: 50%; }
+.newapi-statusdot--ok { background: var(--dsw-alias-state-success-primary, #22c55e); }
+.newapi-statusdot--warn { background: var(--dsw-alias-state-warning-primary, #eab308); }
+.newapi-count { flex: none; color: var(--dsw-alias-label-tertiary); font-size: 12px; white-space: nowrap; }
+.newapi-group-body { padding-top: 12px; }
+
 /* Model catalog, mirroring ui-settings-models: one bordered entry per
    model, id and display name on the row, capacities behind the row's own
    disclosure. */
@@ -91,9 +130,14 @@ const SECTION_CSS = `
 }
 .newapi-modelrow {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 6px;
+}
+.newapi-vision {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--dsw-alias-label-tertiary); font-size: 12px;
+  white-space: nowrap;
 }
 /* Square, label-free affordances: the row's own inputs carry the meaning, so
    the actions stay glyphs and announce themselves through aria-label. */
@@ -120,15 +164,15 @@ const SECTION_CSS = `
 }
 .newapi-modelfield { display: flex; flex-direction: column; gap: 4px; }
 .newapi-modelfield-label { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 18px; }
-.newapi-addmodel {
+.newapi-addmodel, .newapi-addgroup {
   box-sizing: border-box; align-self: flex-start; display: inline-flex; align-items: center;
   gap: 4px; height: 28px; padding: 0 10px;
   border: 1px solid var(--dsw-alias-border-l2); border-radius: 14px;
   background: transparent; color: var(--dsw-alias-label-primary);
   font: inherit; font-size: 12px; cursor: pointer;
 }
-.newapi-addmodel:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
-.newapi-addmodel:disabled { opacity: 0.4; cursor: default; }
+.newapi-addmodel:hover:not(:disabled), .newapi-addgroup:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.newapi-addmodel:disabled, .newapi-addgroup:disabled { opacity: 0.4; cursor: default; }
 .newapi-candidates { border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
 .newapi-candidates ul { list-style: none; padding: 0; margin: 8px 0; }
 /* Proxy control + models.dev params panel. */

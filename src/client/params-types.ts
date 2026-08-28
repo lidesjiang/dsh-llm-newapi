@@ -19,10 +19,14 @@ export interface ModelsDevMatch {
   reasoningEfforts?: string[]
   /** True when this match's provider is the model's official vendor. */
   official?: boolean
+  /** True when the catalog entry accepts image input (vision model). */
+  vision?: boolean
 }
 
 /** Request payload of the `models-dev-params` RPC endpoint. */
 export interface ModelsDevParamsRequest {
+  /** Provider route whose group owns the hints and proxy fallback. */
+  provider?: string
   /** Gateway model ids to look up, verbatim. */
   modelIds: string[]
   /** Forward-proxy URL to route the api.json download through, when enabled. */

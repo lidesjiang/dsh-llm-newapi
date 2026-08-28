@@ -11,7 +11,7 @@
 import { CallId, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { DONE } from './sse.ts'
-import type { WireChunk, WireUsage } from './types.ts'
+import type { ResponsesEvent, ResponsesUsage, WireChunk, WireUsage } from './types.ts'
 
 /** One open block under assembly. */
 interface OpenBlock {
@@ -185,4 +185,206 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
   // parseSse guarantees the [DONE] sentinel (or throws); reaching here means
   // the payload source violated that contract.
   throw new LlmError('SSE payload stream ended without [DONE]', 'STREAM_CLOSED')
+}
+
+// ─── Responses API translation ────────────────────────────────────────────
+
+/**
+ * Map Responses-API usage to harness TokenUsage. `input_tokens` includes
+ * cache hits; the harness convention is disjoint counts, so cache reads are
+ * subtracted out.
+ * @param usage - usage from the terminal `response.completed` event.
+ * @returns disjoint harness counts; cache/reasoning fields present only when the wire reported them.
+ */
+export function mapResponsesUsage(usage: ResponsesUsage): TokenUsage {
+  const cacheRead = usage.input_tokens_details?.cached_tokens
+  const reasoning = usage.output_tokens_details?.reasoning_tokens
+  return {
+    inputTokens: usage.input_tokens - (cacheRead ?? 0),
+    outputTokens: usage.output_tokens,
+    ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
+    ...reasoning !== undefined ? { reasoningTokens: reasoning } : {},
+  }
+}
+
+/**
+ * Translate Responses-API SSE payloads into the same StreamChunk contract as
+ * the chat path. One stateful block per streamed output slot: text from
+ * `response.output_text.delta`, tool calls opened by `response.output_item
+ * .added` (function_call) and filled by `response.function_call_arguments
+ * .delta`. The stream is terminated by the terminal events
+ * `response.completed` / `response.incomplete` / `response.failed` (and the
+ * `[DONE]` sentinel, when a gateway appends one) — flush blocks, then the
+ * finish/usage. An in-band `error` event throws.
+ * @param payloads - SSE data payloads from {@link parseSse} (no `[DONE]` requirement).
+ * @returns deltas as they arrive; `block-end`s, `usage`, and `finish` flush on the terminal event.
+ */
+export async function* translateResponses(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk> {
+  let nextIndex = 0
+  let textBlock: OpenBlock | undefined
+  const toolBlocks = new Map<number, OpenBlock>()
+  const order: OpenBlock[] = []
+  let pendingUsage: TokenUsage | undefined
+
+  function open(kind: OpenBlock['kind']): OpenBlock {
+    const block: OpenBlock = { index: nextIndex++, kind, text: '' }
+    order.push(block)
+    return block
+  }
+
+  /** Flush every assembled block and the deferred usage. */
+  function* flush(): Generator<StreamChunk> {
+    for (const block of order) {
+      yield { type: 'block-end', index: block.index, block: closeBlock(block) }
+    }
+    if (pendingUsage !== undefined) yield { type: 'usage', usage: pendingUsage }
+  }
+
+  /** Terminal finish; an empty streamed response degrades to EMPTY_RESPONSE. */
+  function finish(reason: FinishReason): StreamChunk {
+    return {
+      type: 'finish',
+      reason: reason.kind === 'stop' && order.length === 0
+        ? {
+          kind: 'error',
+          failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+        }
+        : reason,
+    }
+  }
+
+  for await (const payload of payloads) {
+    if (payload === DONE) {
+      yield* flush()
+      yield finish({ kind: 'stop' })
+      return
+    }
+
+    let event: ResponsesEvent
+    try {
+      event = JSON.parse(payload) as ResponsesEvent
+    } catch {
+      throw new LlmError(`malformed SSE payload: ${payload.slice(0, 120)}`, 'MALFORMED_RESPONSE')
+    }
+
+    switch (event.type) {
+      case 'response.output_text.delta': {
+        const delta = event.delta
+        if (typeof delta === 'string' && delta.length > 0) {
+          if (!textBlock) {
+            textBlock = open('text')
+            yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+          }
+          textBlock.text += delta
+          yield { type: 'text-delta', index: textBlock.index, text: delta }
+        }
+        break
+      }
+
+      case 'response.output_item.added': {
+        const item = event.item
+        if (item?.type !== 'function_call') break
+        const outputIndex = event.output_index ?? 0
+        const block = open('tool-call')
+        toolBlocks.set(outputIndex, block)
+        if (item.call_id !== undefined && item.call_id.length > 0) block.callId = item.call_id
+        if (block.callId === undefined && item.id !== undefined && item.id.length > 0) block.callId = item.id
+        if (item.name !== undefined && item.name.length > 0) block.name = item.name
+        yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+        if (typeof item.arguments === 'string' && item.arguments.length > 0) {
+          block.text += item.arguments
+          yield {
+            type: 'tool-call-delta',
+            index: block.index,
+            id: CallId(block.callId ?? ''),
+            ...block.name !== undefined ? { name: block.name } : {},
+            argumentsDelta: item.arguments,
+          }
+        }
+        break
+      }
+
+      case 'response.function_call_arguments.delta': {
+        const outputIndex = event.output_index ?? 0
+        let block = toolBlocks.get(outputIndex)
+        if (!block) {
+          // Argument deltas may lead the added event on non-conforming
+          // gateways; open the call on first fragment.
+          block = open('tool-call')
+          toolBlocks.set(outputIndex, block)
+          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+        }
+        const delta = event.delta ?? ''
+        block.text += delta
+        yield {
+          type: 'tool-call-delta',
+          index: block.index,
+          id: CallId(block.callId ?? ''),
+          ...block.name !== undefined ? { name: block.name } : {},
+          argumentsDelta: delta,
+        }
+        break
+      }
+
+      case 'response.output_item.done': {
+        // Non-conforming gateways may deliver the whole function call here
+        // instead of argument deltas; adopt identity and (only if no
+        // argument fragment arrived) the full arguments — never double them.
+        const item = event.item
+        const block = toolBlocks.get(event.output_index ?? 0)
+        if (item?.type !== 'function_call' || block === undefined) break
+        if (item.call_id !== undefined && item.call_id.length > 0) block.callId = item.call_id
+        if (block.callId === undefined && item.id !== undefined && item.id.length > 0) block.callId = item.id
+        if (item.name !== undefined && item.name.length > 0) block.name = item.name
+        if (block.text.length === 0 && typeof item.arguments === 'string' && item.arguments.length > 0) {
+          block.text += item.arguments
+          yield {
+            type: 'tool-call-delta',
+            index: block.index,
+            id: CallId(block.callId ?? ''),
+            ...block.name !== undefined ? { name: block.name } : {},
+            argumentsDelta: item.arguments,
+          }
+        }
+        break
+      }
+
+      case 'response.completed': {
+        if (event.response?.usage) pendingUsage = mapResponsesUsage(event.response.usage)
+        yield* flush()
+        yield finish({ kind: 'stop' })
+        return
+      }
+
+      case 'response.incomplete': {
+        const reason = event.response?.incomplete_details?.reason ?? 'unknown'
+        yield* flush()
+        yield finish({ kind: 'error', failure: { message: `model stopped: ${reason}`, code: 'INCOMPLETE' } })
+        return
+      }
+
+      case 'response.failed': {
+        const failure = event.response?.error
+        yield* flush()
+        yield finish({
+          kind: 'error',
+          failure: {
+            message: failure?.message ?? 'model response failed',
+            code: failure?.code ?? 'RESPONSE_FAILED',
+          },
+        })
+        return
+      }
+
+      case 'error': {
+        throw new LlmError(
+          event.error?.message ?? 'Responses API stream error',
+          event.error?.code ?? 'INVALID_REQUEST',
+        )
+      }
+    }
+  }
+
+  // No terminal event arrived before EOF — the stream is truncated.
+  throw new LlmError('Responses-API SSE payload stream ended without a terminal event', 'STREAM_CLOSED')
 }

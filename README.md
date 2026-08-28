@@ -72,6 +72,9 @@ After install: a "NewAPI" page appears in the settings panel → fill in the API
   name: dsh-llm-newapi
   config:
     baseURL: http://gw.local:3000/v1   # include the /v1 prefix; falls back to env NEWAPI_BASE_URL → placeholder
+    # apiType: chat                    # wire protocol: 'chat' (default, POST {baseURL}/chat/completions)
+    #                                   or 'responses' (OpenAI Responses API, POST {baseURL}/responses,
+    #                                   for agents / multi-step output / tool calling)
     # models:                          # suggested catalog; empty by default, use "Fetch model info" to pull /models
     #   - id: deepseek-chat
     #     contextWindow: 65536
@@ -114,6 +117,8 @@ npm run cache:models-dev      # cache models.dev/api.json locally to .cache/ (gi
 After changing source, re-run `npm run build` and **commit `lib/`** — `github:` installs run from the committed artifacts, and the CI "Committed artifacts are current" step rejects stale outputs.
 
 ## Status
+
+v0.9.0: per-group API type — each gateway group now selects its wire protocol: `chat` (default, `POST {baseURL}/chat/completions`) or `responses` (the OpenAI Responses API, `POST {baseURL}/responses`, suited to agents / multi-step output / tool calling). A responses group serializes the Responses-API shape (`instructions`, role messages plus `function_call` / `function_call_output` input items, `max_output_tokens`, `reasoning.effort`, top-level tool `name`) and translates Responses-API SSE events (`output_text.delta`, `output_item.added`, `function_call_arguments.delta`, terminated by `completed` / `incomplete` / `failed`) into the same harness stream contract — `/responses` streams need no `[DONE]` sentinel. Settings page: per-group API-type selector plus a header badge on responses groups.
 
 v0.8.3: tool-call id/name delta hardening (#1) — some gateways (glm-5.3 via qcplay) repeat `tool_calls[].id` and `function.name` on every continuation delta as **empty strings** instead of omitting the fields; the presence-only merge overwrote the first delta's real tool name with `''`, so every tool call failed as `unknown tool`. The translator now accepts only non-empty `id`/`name` values (matching the existing non-empty guards on text/reasoning deltas); argument concatenation is unchanged.
 

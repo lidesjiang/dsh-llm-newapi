@@ -12,6 +12,7 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmDiscoveredModel, LlmModelDiscoveryRequest, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials';
+import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment';
 import type { ModelsDevApi, ModelsDevMatch, ModelsDevParamsRequest, ModelsDevParamsResponse, ProviderHints, WireError } from './types.js';
 /** Prefix for adapter-raised diagnostics. */
 export declare const PKG = "llm-newapi";
@@ -46,6 +47,8 @@ export interface NewApiCatalogModel {
      * {@link reasoningEfforts}. Absence defaults to the highest declared rung.
      */
     defaultReasoningEffort?: string;
+    /** Explicit image-input support; `true` declares `['text','image']` modalities so the harness keeps image content for this model. Absent means text-only. */
+    vision?: boolean;
 }
 /**
  * Validated connection facts for one operation. The plugin's
@@ -54,14 +57,25 @@ export interface NewApiCatalogModel {
  * makes a configuration change reach the next request without re-registration.
  */
 export interface NewApiConnectionOptions {
-    /** Gateway base including the `/v1` prefix; `/chat/completions` and `/models` are appended. */
+    /** Provider route id this connection serves (the group's route). */
+    provider: string;
+    /** Human-readable group name shown in selectors. */
+    displayName: string;
+    /**
+     * Wire protocol for this group: `chat` (default) hits
+     * `POST {baseURL}/chat/completions`; `responses` hits
+     * `POST {baseURL}/responses` (the OpenAI Responses API shape, for agents /
+     * multi-step output / tool calling).
+     */
+    apiType?: 'chat' | 'responses';
+    /** Gateway base including the `/v1` prefix; `/chat/completions`, `/responses`, and `/models` are appended. */
     baseURL: string;
     /**
      * Credential reference of this same resolution, resolved per request.
      * Travelling with the endpoint is the point: a request can never pair one
      * generation's URL with another generation's secret. The reference is the
-     * fixed id `newapi` — the web settings page owns the value, and a literal
-     * key is not a configuration value.
+     * group's `newapi-<group>` ref — the web settings page owns the value, and a
+     * literal key is not a configuration value.
      */
     apiKeyRef: CredentialRef;
     /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
@@ -91,8 +105,13 @@ export interface NewApiConnectionOptions {
 }
 /** Constructor options for {@link NewApiAdapter}: the operation-local resolution hooks the plugin owns. */
 export interface NewApiAdapterOptions {
-    /** Current validated connection facts; called once per operation. */
-    options: () => NewApiConnectionOptions;
+    /** Current validated connection facts for one provider route; called once per operation. */
+    options: (provider: string) => NewApiConnectionOptions;
+    /**
+     * Provider route whose connection facts back an endpoint-less draft.
+     * Defaults to `newapi` when omitted (legacy single-gateway usage).
+     */
+    defaultProvider?: () => string;
     /**
      * Resolve the bearer token for the connection facts of one request. The
      * snapshot is passed in — never re-read — so the key can only ever come
@@ -107,6 +126,14 @@ export interface NewApiAdapterOptions {
      * catalogs); absent when no route claims the id.
      */
     officialProviderOf?: (modelId: string) => Promise<string | undefined>;
+    /**
+     * Resolve one durable image reference to request bytes, serving a vision
+     * catalog row. Wired by the plugin from `ctx.attachments`; absent on a
+     * deployment without the attachment service — then a vision row still
+     * declares image modalities, and the request serialization rejects image
+     * content explicitly instead of silently dropping it.
+     */
+    resolveImage?: (ref: ImageAttachmentRef, signal: AbortSignal) => Promise<StoredImageAttachment>;
 }
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export declare const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000;
@@ -184,7 +211,7 @@ export declare class NewApiAdapter extends LlmAdapter {
     private readonly config;
     constructor(config: NewApiAdapterOptions);
     providerInfo(provider: string): LlmProviderInfo;
-    providerRetryPolicy(_provider: string): ResolvedRetryPolicy;
+    providerRetryPolicy(provider: string): ResolvedRetryPolicy;
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     /**
@@ -196,6 +223,11 @@ export declare class NewApiAdapter extends LlmAdapter {
      * @returns the advertised models, deduplicated by the runtime, enriched
      *   with context/maxTokens facts from the configured catalog when ids match.
      */
+    /**
+     * The provider route backing an endpoint-less draft: the configured
+     * default, else the legacy `newapi` route.
+     */
+    private defaultProviderRoute;
     discoverModels(request: LlmModelDiscoveryRequest): Promise<readonly LlmDiscoveredModel[]>;
     /**
      * Download the models.dev catalog (optionally through the configured
@@ -221,5 +253,15 @@ export declare class NewApiAdapter extends LlmAdapter {
      */
     private prioritizeOfficial;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /**
+     * Resolve every image block of a request to a data URL when the selected
+     * model is a vision catalog row and a resolver is wired. Missing resolver
+     * or text-only row returns `undefined` (text-only serialization).
+     * @param options - the request; `options.model` selects the catalog row.
+     * @param signal - caller cancellation for attachment reads.
+     * @param connection - the group's connection facts.
+     * @returns attachmentId → data URL, or `undefined` when no image support.
+     */
+    private resolveRequestImages;
     private request;
 }

@@ -12,6 +12,19 @@ afterEach(cleanup)
 
 const t = (key: keyof typeof en): string => en[key]
 
+/** Expand the first (collapsed) gateway card so its form fields render. */
+async function expandFirstGroup(): Promise<void> {
+  const toggles = await waitFor(() => screen.getAllByLabelText(t('groupExpanded')))
+  fireEvent.click(toggles[0] as HTMLElement)
+}
+
+/** One stored group section value (the new groups shape). */
+function storedGroups(models: unknown[] = [{ id: 'deepseek-chat', contextWindow: 65536 }]) {
+  return {
+    groups: [{ id: 'newapi', name: 'NewAPI', baseURL: 'http://gw.local:3000/v1', models }],
+  }
+}
+
 /** A wire face answering one resolved llm-newapi section. */
 function wireFace(overrides: Partial<{
   describeAnswer: unknown
@@ -28,7 +41,7 @@ function wireFace(overrides: Partial<{
             namespaces: [{
               ns: 'llm-newapi',
               schema: {},
-              value: { baseURL: 'http://gw.local:3000/v1', models: [{ id: 'deepseek-chat', contextWindow: 65536 }] },
+              value: storedGroups(),
               applies: 'live',
               secrets: [],
               revision: 7,
@@ -66,17 +79,14 @@ function paramsFace() {
 }
 
 describe('NewApiSection mount', () => {
-  it('loads the section on mount and renders the configuration form', async () => {
+  it('loads the section on mount and renders the nav while collapsed', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
 
-    // The form fields the user configures the provider through.
-    await waitFor(() => { expect(screen.getByLabelText(t('baseUrl'))).toBeTruthy() })
-    expect((screen.getByLabelText(t('baseUrl')) as HTMLInputElement).value)
-      .toBe('http://gw.local:3000/v1')
-    expect(screen.getByLabelText(t('keyInput'))).toBeTruthy()
-    expect(screen.getByText(t('fetchModels'))).toBeTruthy()
-    expect(screen.getByText(t('apply'))).toBeTruthy()
+    // Groups start collapsed; the add-group control is visible.
+    await waitFor(() => { expect(screen.getByText(t('addGroup'))).toBeTruthy() })
+    // The form fields are inside the collapsed group body and therefore not rendered.
+    expect(screen.queryByLabelText(t('baseUrl'))).toBeNull()
 
     // The mount itself interrogated the settings plane.
     expect(api.settings.describe).toHaveBeenCalledTimes(1)
@@ -99,10 +109,9 @@ describe('environment-supplied credential (read-only)', () => {
   it('locks the key field with the launch-environment placeholder', async () => {
     const api = wireFace({ credentialsAnswer: envCredential })
     render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByLabelText(t('keyInput'))).toBeTruthy() })
-    // The official ProviderEditor pattern: writable === false disables the
-    // input and the placeholder states the fact (launch environment, read-only).
     expect((screen.getByLabelText(t('keyInput')) as HTMLInputElement).disabled).toBe(true)
     expect((screen.getByLabelText(t('keyInput')) as HTMLInputElement).placeholder).toBe(t('keyEnvLocked'))
   })
@@ -110,6 +119,7 @@ describe('environment-supplied credential (read-only)', () => {
   it('saves the section without attempting a shadowed credential write', async () => {
     const api = wireFace({ credentialsAnswer: envCredential })
     render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByLabelText(t('baseUrl'))).toBeTruthy() })
     fireEvent.change(screen.getByLabelText(t('baseUrl')), { target: { value: 'http://other:3000/v1' } })
@@ -122,52 +132,49 @@ describe('environment-supplied credential (read-only)', () => {
 })
 
 describe('models.dev params update', () => {
+  function groupsValue(models: unknown[]) {
+    return {
+      writable: true,
+      hasDocument: true,
+      namespaces: [{
+        ns: 'llm-newapi',
+        schema: {},
+        value: storedGroups(models),
+        applies: 'live',
+        secrets: [],
+        revision: 7,
+      }],
+    }
+  }
+
   it('shows the summary and applies chosen provider facts overwriting existing values', async () => {
     const api = wireFace({
-      describeAnswer: {
-        writable: true,
-        hasDocument: true,
-        namespaces: [{
-          ns: 'llm-newapi',
-          schema: {},
-          value: {
-            baseURL: 'http://gw.local:3000/v1',
-            models: [{ id: 'deepseek-chat' }, { id: 'qwen/qwen-max' }, { id: 'mystery-model' }],
-          },
-          applies: 'live',
-          secrets: [],
-          revision: 7,
-        }],
-      },
+      describeAnswer: groupsValue([{ id: 'deepseek-chat' }, { id: 'qwen/qwen-max' }, { id: 'mystery-model' }]),
     })
     const fetchModelParams = paramsFace()
     render(<NewApiSection api={api as never} t={t} fetchModelParams={fetchModelParams as never} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByText(t('updateParams'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('updateParams')))
     await waitFor(() => { expect(screen.getByText(t('paramsTitle'))).toBeTruthy() })
-    // Completion feedback: a status line names the matched/unmatched counts
-    // right away, instead of only the panel below a possibly long list.
     expect(screen.getByRole('status').textContent).toBe(
       t('paramsSummary').replace('{matched}', '2').replace('{unmatched}', '1'),
     )
-    // The counts appear twice by design: the status line and the panel summary.
     expect(screen.getAllByText((_, element) =>
       element?.textContent === t('paramsSummary').replace('{matched}', '2').replace('{unmatched}', '1'),
     )).toHaveLength(2)
     expect(screen.getByText(t('paramsUnmatched'))).toBeTruthy()
-    // The ambiguous id offers a provider picker with both entries.
     const picker = screen.getByLabelText(`${t('paramsProvider')} qwen/qwen-max`) as HTMLSelectElement
     expect(picker.options.length).toBe(2)
 
-    // Overwrite applies the first match of each id (deepseek 128K/8K, qwen 262K/32K);
-    // mystery-model keeps its (empty) values.
     fireEvent.click(screen.getByText(t('paramsOverwrite')))
     await waitFor(() => { expect(screen.getByText(new RegExp(t('paramsApplied')))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const models = api.settings.mutate.mock.calls[0][0].ops
-      .find((op: { path: string[] }) => op.path[0] === 'models').value
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    const models = groups[0].models
     expect(models[0]).toEqual({ id: 'deepseek-chat', contextWindow: 128_000, maxTokens: 8_192, reasoningEfforts: ['low', 'medium', 'high'] })
     expect(models[1]).toEqual({ id: 'qwen/qwen-max', contextWindow: 262_144, maxTokens: 32_768 })
     expect(models[2]).toEqual({ id: 'mystery-model' })
@@ -177,17 +184,18 @@ describe('models.dev params update', () => {
     const api = wireFace()
     const fetchModelParams = paramsFace()
     render(<NewApiSection api={api as never} t={t} fetchModelParams={fetchModelParams as never} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByText(t('updateParams'))).toBeTruthy() })
-    // The fixture row already has contextWindow 65536; blank mode keeps it and only fills maxTokens.
     fireEvent.click(screen.getByText(t('updateParams')))
     await waitFor(() => { expect(screen.getByText(t('paramsOverwrite'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('paramsFillBlank')))
     await waitFor(() => { expect(screen.getByText(new RegExp(t('paramsApplied')))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const models = api.settings.mutate.mock.calls[0][0].ops
-      .find((op: { path: string[] }) => op.path[0] === 'models').value
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    const models = groups[0].models
     expect(models[0]).toEqual({ id: 'deepseek-chat', contextWindow: 65_536, maxTokens: 8_192, reasoningEfforts: ['low', 'medium', 'high'] })
   })
 
@@ -195,14 +203,15 @@ describe('models.dev params update', () => {
     const api = wireFace()
     const fetchModelParams = paramsFace()
     render(<NewApiSection api={api as never} t={t} fetchModelParams={fetchModelParams as never} />)
+    await expandFirstGroup()
 
-    await waitFor(() => { expect(screen.getByLabelText(t('proxyToggle'))).toBeTruthy() })
+    await waitFor(() => { expect(screen.getByLabelText(`${t('proxyToggle')} 1`)).toBeTruthy() })
     fireEvent.click(screen.getByText(t('updateParams')))
     await waitFor(() => { expect(fetchModelParams).toHaveBeenCalledTimes(1) })
     expect(fetchModelParams.mock.calls[0][0].proxyUrl).toBeUndefined()
 
-    fireEvent.click(screen.getByLabelText(t('proxyToggle')))
-    fireEvent.change(screen.getByLabelText(t('proxyUrl')), { target: { value: 'http://127.0.0.1:7897' } })
+    fireEvent.click(screen.getByLabelText(`${t('proxyToggle')} 1`))
+    fireEvent.change(screen.getByLabelText(`${t('proxyUrl')} 1`), { target: { value: 'http://127.0.0.1:7897' } })
     fireEvent.click(screen.getByText(t('updateParams')))
     await waitFor(() => { expect(fetchModelParams).toHaveBeenCalledTimes(2) })
     expect(fetchModelParams.mock.calls[1][0].proxyUrl).toBe('http://127.0.0.1:7897')
@@ -210,13 +219,20 @@ describe('models.dev params update', () => {
     fireEvent.click(screen.getByText(t('fetchCancel')))
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const proxy = api.settings.mutate.mock.calls[0][0].ops
-      .find((op: { path: string[] }) => op.path[0] === 'proxy').value
-    expect(proxy).toEqual({ enabled: true, url: 'http://127.0.0.1:7897' })
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups[0].proxy).toEqual({ enabled: true, url: 'http://127.0.0.1:7897' })
   })
 })
 
 describe('model catalog', () => {
+  /** The models op of the first mutate call. */
+  function savedModels(api: ReturnType<typeof wireFace>): Array<Record<string, unknown>> {
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    return groups[0].models
+  }
+
   it('sorts fetched candidates by id and the adopted rows keep that order', async () => {
     const api = wireFace()
     api.llm.discoverModels.mockResolvedValueOnce({
@@ -226,40 +242,31 @@ describe('model catalog', () => {
       },
     })
     render(<NewApiSection api={api as never} t={t} fetchModelParams={paramsFace() as never} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByText(t('fetchModels'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('fetchModels')))
     await waitFor(() => { expect(screen.getByText(t('fetchAdopt'))).toBeTruthy() })
-    // The picker lists candidates in id order even though the reply did not.
     const listed = screen.getAllByRole('listitem').map(item => item.textContent ?? '')
     expect(listed[0]).toContain('aa-first')
     expect(listed[1]).toContain('deepseek-chat')
     expect(listed[2]).toContain('zhipu/glm-5.3')
 
     fireEvent.click(screen.getByText(t('fetchAdopt')))
-    // The form keeps the sorted order: existing row and adopted rows merge
-    // alphabetically instead of appending the new ones at the end.
     await waitFor(() => { expect((screen.getByLabelText(`${t('modelId')} 1`) as HTMLInputElement).value).toBe('aa-first') })
     expect((screen.getByLabelText(`${t('modelId')} 2`) as HTMLInputElement).value).toBe('deepseek-chat')
     expect((screen.getByLabelText(`${t('modelId')} 3`) as HTMLInputElement).value).toBe('zhipu/glm-5.3')
   })
 
-  /** The models op of the first mutate call. */
-  function savedModels(api: ReturnType<typeof wireFace>): Array<Record<string, unknown>> {
-    return api.settings.mutate.mock.calls[0][0].ops
-      .find((op: { path: string[] }) => op.path[0] === 'models').value
-  }
-
   it('folds capacities behind the row disclosure and adopts K/M entry', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByLabelText(t('baseUrl'))).toBeTruthy() })
-    // Capacities are not on the row until its disclosure opens.
     expect(screen.queryByLabelText(`${t('contextWindow')} 1`)).toBeNull()
     fireEvent.click(screen.getByLabelText(`${t('modelAdvanced')} 1`))
     const context = await waitFor(() => screen.getByLabelText(`${t('contextWindow')} 1`))
-    // 65536 is not a whole multiple of 1000, so it stays written out.
     expect((context as HTMLInputElement).value).toBe('65536')
 
     fireEvent.change(context, { target: { value: '256K' } })
@@ -271,6 +278,7 @@ describe('model catalog', () => {
   it('drops an emptied name instead of storing an empty string', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
 
     const name = await waitFor(() => screen.getByLabelText(`${t('modelName')} 1`))
     fireEvent.change(name, { target: { value: 'Renamed' } })
@@ -283,28 +291,25 @@ describe('model catalog', () => {
   it('clears every row through the clear action and saves an empty catalog', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} fetchModelParams={paramsFace() as never} />)
+    await expandFirstGroup()
 
-    // The fixture carries one model row; clear removes it and the empty
-    // hint appears in its place.
     await waitFor(() => { expect(screen.getByText(t('clearModels'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('clearModels')))
     await waitFor(() => { expect(screen.getByText(t('modelsEmpty'))).toBeTruthy() })
     expect(screen.queryByLabelText(`${t('modelId')} 1`)).toBeNull()
-    // An empty catalog disables the action until a row exists again.
     expect((screen.getByText(t('clearModels')) as HTMLButtonElement).disabled).toBe(true)
 
-    // Saving writes the emptied array (the static describe stub still
-    // answers the old fixture after reload — irrelevant to the written ops).
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const models = api.settings.mutate.mock.calls[0][0].ops
-      .find((op: { path: string[] }) => op.path[0] === 'models').value
-    expect(models).toEqual([])
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups[0].models).toEqual([])
   })
 
   it('adds a row through the add-model action and refuses a save with an empty id', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
 
     await waitFor(() => { expect(screen.getByText(t('addModel'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('addModel')))
@@ -313,5 +318,87 @@ describe('model catalog', () => {
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(screen.getByText(new RegExp(t('modelIdRequired')))).toBeTruthy() })
     expect(api.settings.mutate).not.toHaveBeenCalled()
+  })
+
+  it('adds a group, refuses duplicate/empty ids, and saves the second gateway', async () => {
+    const api = wireFace()
+    render(<NewApiSection api={api as never} t={t} />)
+
+    await waitFor(() => { expect(screen.getByText(t('addGroup'))).toBeTruthy() })
+    fireEvent.click(screen.getByText(t('addGroup')))
+    // The new group card renders its own base URL field.
+    await waitFor(() => { expect(screen.getByLabelText(`${t('baseUrl')} 2`)).toBeTruthy() })
+    fireEvent.change(screen.getByLabelText(`${t('groupId')} 2`), { target: { value: 'ginka' } })
+    fireEvent.change(screen.getByLabelText(`${t('baseUrl')} 2`), { target: { value: 'http://ginka.local:8080/v1' } })
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups.length).toBe(2)
+    expect(groups[1].id).toBe('ginka')
+    expect(groups[1].baseURL).toBe('http://ginka.local:8080/v1')
+  })
+})
+
+describe('API type selection', () => {
+  it('defaults a group to chat and saves responses when selected', async () => {
+    const api = wireFace()
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    const picker = await waitFor(() => screen.getByLabelText(`${t('apiType')} 1`)) as HTMLSelectElement
+    expect(picker.value).toBe('chat')
+
+    fireEvent.change(picker, { target: { value: 'responses' } })
+    await waitFor(() => { expect(screen.getByText(t('apiTypeResponsesHint'))).toBeTruthy() })
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups[0].apiType).toBe('responses')
+  })
+
+  it('renders the responses badge from storage and keeps it on save', async () => {
+    const api = wireFace({
+      describeAnswer: {
+        writable: true,
+        hasDocument: true,
+        namespaces: [{
+          ns: 'llm-newapi',
+          schema: {},
+          value: { groups: [{ id: 'agents', apiType: 'responses', baseURL: 'http://agents.local:8080/v1' }] },
+          applies: 'live',
+          secrets: [],
+          revision: 7,
+        }],
+      },
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+
+    // The collapsed card already shows the protocol badge.
+    await waitFor(() => { expect(screen.getAllByText(t('apiTypeResponses'))[0]).toBeTruthy() })
+    await expandFirstGroup()
+    const picker = await waitFor(() => screen.getByLabelText(`${t('apiType')} 1`)) as HTMLSelectElement
+    expect(picker.value).toBe('responses')
+
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups[0].apiType).toBe('responses')
+  })
+
+  it('omits apiType from the saved group while chat is the default', async () => {
+    const api = wireFace()
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    const picker = await waitFor(() => screen.getByLabelText(`${t('apiType')} 1`)) as HTMLSelectElement
+    expect(picker.value).toBe('chat')
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const groups = api.settings.mutate.mock.calls[0][0].ops
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+    expect(groups[0].apiType).toBeUndefined()
   })
 })

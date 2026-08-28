@@ -1,16 +1,12 @@
 /**
- * The NewAPI settings section: API key (write-only), gateway base URL, and
- * the model catalog with endpoint interrogation. Pure props — no ctx, no
- * contexts, no subscription machinery; everything arrives through the inject
- * face the apply closure owns (api wire face + bound translate). Styles come
- * from the fiber-scoped `newapi-*` stylesheet the apply closure injects; it
- * rides the shell's `--dsw-alias-*` tokens, so light and dark themes both
- * render correctly.
- *
- * The model catalog mirrors the official Models page (`ModelListEditor`):
- * one bordered entry per model with id and display name on the row, the two
- * token capacities behind the row's own disclosure, K/M-suffixed capacity
- * entry, and per-field text buffers so a count is not rewritten mid-word.
+ * The NewAPI settings section: a group manager for multiple third-party
+ * gateways. Each group is a card with its own API key (write-only), gateway
+ * base URL, proxy, and model catalog with endpoint interrogation. The model
+ * catalog mirrors the official Models page: one bordered entry per model with
+ * id and display name on the row, capacities + reasoning efforts + a vision
+ * toggle behind the row's own disclosure. Pure props — no ctx, no contexts,
+ * no subscription machinery; everything arrives through the inject face the
+ * apply closure owns. Styles come from the fiber-scoped `newapi-*` stylesheet.
  */
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -19,14 +15,17 @@ import type { NewApiKey } from './locale.ts'
 import type { ModelsDevParamsRequest, ModelsDevParamsResponse } from './params-types.ts'
 
 /**
- * One catalog entry, structurally open like the official editors: a field
- * this card does not edit survives being edited here rather than being
+ * One editable group entry, structurally open like the official editors: a
+ * field this card does not edit survives being edited here rather than being
  * dropped by a rebuild.
  */
+type GroupDraft = Record<string, unknown>
+
+/** A group's model rows, structurally open like the official editors. */
 type ModelDraft = Record<string, unknown>
 
 /** A row's text field, or the empty string when unset or not a string. */
-function textOf(model: ModelDraft, key: string): string {
+function textOf(model: GroupDraft | ModelDraft, key: string): string {
   const value = model[key]
   return typeof value === 'string' ? value : ''
 }
@@ -46,12 +45,7 @@ const CAPACITY_PATTERN = /^(\d+(?:\.\d+)?)([km])?$/i
 /** Decimal suffix scales — `1M` is 1000K, matching how model capacities are quoted. */
 const CAPACITY_SCALE = { k: 1_000, m: 1_000_000 } as const
 
-/**
- * Read a typed capacity, so a user can write `256K` or `1M` instead of
- * counting zeroes. The stored value stays a plain token count.
- * @param text - raw field text.
- * @returns the count; `undefined` when blank (drop), `NaN` when unreadable.
- */
+/** Read a typed capacity, so a user can write `256K` or `1M`. */
 function parseCapacity(text: string): number | undefined {
   const trimmed = text.trim()
   if (trimmed.length === 0) return undefined
@@ -60,19 +54,11 @@ function parseCapacity(text: string): number | undefined {
   const suffix = match[2]?.toLowerCase()
   const scale = suffix === 'k' || suffix === 'm' ? CAPACITY_SCALE[suffix] : 1
   const scaled = Number(match[1]) * scale
-  // A decimal multiple is exact in intent but not in binary floating point,
-  // so an integral intent snaps back.
   const rounded = Math.round(scaled)
   return Math.abs(scaled - rounded) < 1e-6 ? rounded : scaled
 }
 
-/**
- * Spell a stored count back in the shortest form that survives a round trip
- * through {@link parseCapacity}; a count that is not a whole number of
- * thousands stays written out.
- * @param value - stored capacity.
- * @returns the field text.
- */
+/** Spell a stored count back in the shortest round-trippable form. */
 function formatCapacity(value: number): string {
   if (!Number.isInteger(value) || value <= 0) return String(value)
   if (value % CAPACITY_SCALE.m === 0) return `${String(value / CAPACITY_SCALE.m)}M`
@@ -80,15 +66,20 @@ function formatCapacity(value: number): string {
   return String(value)
 }
 
-/**
- * What an empty capacity field is worth, shown as its placeholder: the
- * adapter's route-level fallback (`defaultContextWindow` 128,000) spelled
- * the way a person would say it. A hint, not a mirror — leaving the field
- * blank keeps the adapter's default.
- */
+/** What an empty capacity field is worth, shown as its placeholder. */
 const CAPACITY_HINT: Readonly<Record<CapacityField, string>> = {
   contextWindow: '128K',
   maxTokens: '8K',
+}
+
+/** The highest rung in a row's declared efforts — the dropdown's value when no preset was chosen. */
+const EFFORT_RUNG: Readonly<Record<string, number>> = {
+  max: 7, xhigh: 6, high: 5, medium: 4, low: 3, minimal: 2, none: 1, default: 0,
+}
+
+function highestOf(efforts: readonly unknown[]): string {
+  const ids = efforts.filter((effort): effort is string => typeof effort === 'string')
+  return [...ids].sort((a, b) => (EFFORT_RUNG[b] ?? -1) - (EFFORT_RUNG[a] ?? -1))[0] ?? ''
 }
 
 /** Disclosure chevron; rotates to point down while its row is open. */
@@ -103,7 +94,7 @@ function IconChevron({ open }: { open: boolean }): ReactNode {
   )
 }
 
-/** Removal glyph for one model row. */
+/** Removal glyph for one model row / group. */
 function IconTrash(): ReactNode {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden>
@@ -115,43 +106,66 @@ function IconTrash(): ReactNode {
   )
 }
 
+/** Add glyph (used for "add group" / "add model"). */
+function IconPlus(): ReactNode {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 /** Inject face: the wire face, the bound translate, and the models.dev params call. */
 export interface NewApiSectionProps {
   api: Pick<IApiClient, 'settings' | 'credentials' | 'llm'>
   t: (key: NewApiKey) => string
-  /** Host-side models.dev catalog lookup (browser sends ids + proxy only). */
   fetchModelParams: (
     request: ModelsDevParamsRequest,
   ) => Promise<{ ok: true; value: ModelsDevParamsResponse } | { ok: false; error: { message: string } }>
 }
 
 const NS = 'llm-newapi'
-/** Credential reference the host half resolves per request (see apply.ts). */
-const KEY_REF = 'newapi'
-
-/** The proxy text box's default and placeholder (mirrors the host default). */
+/** The default proxy text box's value and placeholder (mirrors the host default). */
 const DEFAULT_PROXY_URL = 'http://127.0.0.1:7890'
 
-/** Convert a stored section value into editable rows without dropping fields. */
-function toDrafts(source: unknown): ModelDraft[] {
+/** Provider route for a group id (mirrors the host's groupRoute). */
+function groupRoute(id: string): string {
+  return id === 'newapi' ? 'newapi' : `newapi-${id}`
+}
+
+/**
+ * Credential ref for a group id (mirrors the host's groupCredRef). The
+ * credentials seam forbids hyphens, so the ref uses the underscore form while
+ * the provider route keeps the hyphenated `newapi-<id>`.
+ */
+function groupCredRef(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_]/g, '_')
+  return id === 'newapi' ? 'newapi' : `newapi_${safe}`
+}
+
+/** Wire protocol of a group: `chat` (default) or `responses`. */
+function apiTypeOf(group: GroupDraft): 'chat' | 'responses' {
+  return textOf(group, 'apiType') === 'responses' ? 'responses' : 'chat'
+}
+
+/** Convert a stored section value into editable group drafts without dropping fields. */
+function toGroupDrafts(source: unknown): GroupDraft[] {
+  if (Array.isArray(source)) {
+    return source.map(entry =>
+      typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+        ? entry as GroupDraft
+        : {})
+  }
+  return []
+}
+
+/** Convert a stored model list into editable rows without dropping fields. */
+function toModelDrafts(source: unknown): ModelDraft[] {
   if (!Array.isArray(source)) return []
   return source.map(entry =>
     typeof entry === 'object' && entry !== null && !Array.isArray(entry)
       ? entry as ModelDraft
       : {})
-}
-
-/**
- * The highest rung in a row's declared efforts — the dropdown's value when
- * no preset has been chosen yet.
- */
-const EFFORT_RUNG: Readonly<Record<string, number>> = {
-  max: 7, xhigh: 6, high: 5, medium: 4, low: 3, minimal: 2, none: 1, default: 0,
-}
-
-function highestOf(efforts: readonly unknown[]): string {
-  const ids = efforts.filter((effort): effort is string => typeof effort === 'string')
-  return [...ids].sort((a, b) => (EFFORT_RUNG[b] ?? -1) - (EFFORT_RUNG[a] ?? -1))[0] ?? ''
 }
 
 /** Buffer key for one capacity field; the row half moves when rows do. */
@@ -161,8 +175,6 @@ function bufferKey(index: number, field: CapacityField): string {
 
 /**
  * Render the NewAPI settings section.
- * @param props - the wire face and the bound translate.
- * @returns the section.
  */
 export function NewApiSection(props: NewApiSectionProps): ReactNode {
   const { api, t } = props
@@ -170,40 +182,36 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   const [errorText, setErrorText] = useState<string | undefined>(undefined)
   const [revision, setRevision] = useState<number>(0)
   const [writable, setWritable] = useState(true)
-  const [keyConfigured, setKeyConfigured] = useState<boolean | undefined>(undefined)
-  /** Whether the credential seam reports the key reference read-only (launch environment). */
-  const [keyLocked, setKeyLocked] = useState(false)
-  const [baseURL, setBaseURL] = useState('')
-  const [keyDraft, setKeyDraft] = useState('')
-  const [models, setModels] = useState<ModelDraft[]>([])
-  // Rows carry an id and a name; capacities stay folded behind the row's own
-  // disclosure rather than crowding every row with four inputs.
-  const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set())
-  // Capacities are edited as text, so a field's keystrokes are held here
-  // rather than re-derived from the parsed count on every change — that
-  // would rewrite `1000` to `1K` mid-word. One entry per field: a single
-  // buffer would be displaced by editing any other field.
-  const [editing, setEditing] = useState<ReadonlyMap<string, string>>(new Map())
+  // Group drafts (each holds id/name/baseURL/models/proxy/...).
+  const [groups, setGroups] = useState<GroupDraft[]>([])
+  // Credential facts per group ref.
+  const [credentials, setCredentials] = useState<Record<string, { configured: boolean; locked: boolean }>>({})
+  // Per-group key draft (write-only input buffers).
+  const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({})
+  // Expanded groups: Set<groupId>.
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(new Set())
+  // Per-group expanded model rows: Map<groupId, Set<rowIndex>>.
+  const [expandedModels, setExpandedModels] = useState<ReadonlyMap<string, ReadonlySet<number>>>(new Map())
+  // Per-group capacity edit buffers: Map<groupId, Map<bufferKey, string>>.
+  const [editing, setEditing] = useState<ReadonlyMap<string, ReadonlyMap<string, string>>>(new Map())
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | undefined>(undefined)
-  const [candidates, setCandidates] = useState<readonly DiscoveredModelView[] | undefined>(undefined)
-  const [picked, setPicked] = useState<ReadonlySet<string>>(new Set())
-  /** Proxy draft for the models.dev download; persisted with the section. */
-  const [proxyEnabled, setProxyEnabled] = useState(false)
-  const [proxyUrl, setProxyUrl] = useState<string>(DEFAULT_PROXY_URL)
-  /** models.dev lookup result the params panel resolves against. */
-  const [params, setParams] = useState<ModelsDevParamsResponse | undefined>(undefined)
-  /** Chosen match index per model id, for ids with several providers. */
-  const [paramChoices, setParamChoices] = useState<ReadonlyMap<string, number>>(new Map())
+  // Fetch-model candidates + picked per group.
+  const [candidates, setCandidates] = useState<ReadonlyMap<string, readonly DiscoveredModelView[]>>(new Map())
+  const [picked, setPicked] = useState<ReadonlyMap<string, ReadonlySet<string>>>(new Map())
+  // Per-group proxy drafts.
+  const [proxies, setProxies] = useState<ReadonlyMap<string, { enabled: boolean; url: string }>>(new Map())
+  // Per-group models.dev params panel.
+  const [params, setParams] = useState<ReadonlyMap<string, ModelsDevParamsResponse>>(new Map())
+  const [paramChoices, setParamChoices] = useState<ReadonlyMap<string, ReadonlyMap<string, number>>>(new Map())
   const [paramsBusy, setParamsBusy] = useState(false)
-  /** The result panel, scrolled into view when a lookup lands. */
   const paramsRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    // Feedback that the lookup finished: the panel may render below the
-    // fold behind a long model list, so bring it to the user. The optional
-    // call keeps non-browser test environments safe.
     paramsRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
   }, [params])
+
+  /** Per-group model rows. */
+  const modelsOf = (group: GroupDraft): ModelDraft[] => toModelDrafts(group.models)
 
   const load = async (): Promise<void> => {
     setStatus('loading')
@@ -224,19 +232,33 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       }
       const value = (section.value ?? {}) as Record<string, unknown>
       setRevision(section.revision)
-      setBaseURL(typeof value.baseURL === 'string' ? value.baseURL : '')
-      setModels(toDrafts(value.models))
-      const proxy = (value.proxy ?? {}) as { enabled?: unknown; url?: unknown }
-      setProxyEnabled(proxy.enabled === true)
-      if (typeof proxy.url === 'string' && proxy.url.length > 0) setProxyUrl(proxy.url)
-      setExpanded(new Set())
-      setEditing(new Map())
-      const credential = await api.credentials.describe({ refs: [KEY_REF] })
+      // Accept both the new `groups` array and the legacy flat section as a
+      // single group, so an existing settings.yaml keeps rendering.
+      const storedGroups = Array.isArray(value.groups) && value.groups.length > 0
+        ? value.groups
+        : [{ id: 'newapi', ...(typeof value.baseURL === 'string' ? { baseURL: value.baseURL } : {}), ...(Array.isArray(value.models) ? { models: value.models } : {}) }]
+      const drafts = toGroupDrafts(storedGroups)
+      setGroups(drafts)
+      // Credential facts for every group ref.
+      const refs = drafts.map(group => groupCredRef(textOf(group, 'id') || 'newapi'))
+      const credential = await api.credentials.describe({ refs })
       if (credential.result.ok) {
-        const view = credential.result.value.credentials[KEY_REF]
-        setKeyConfigured(view?.configured)
-        setKeyLocked(view?.writable === false)
+        const byRef: Record<string, { configured: boolean; locked: boolean }> = {}
+        for (const ref of refs) {
+          const view = credential.result.value.credentials[ref]
+          byRef[ref] = {
+            configured: view?.configured === true,
+            locked: view?.writable === false,
+          }
+        }
+        setCredentials(byRef)
       }
+      // Groups start collapsed: with several gateways an expanded-by-default
+      // page is a wall of forms. The chevron opens one on demand.
+      setExpandedGroups(new Set())
+      setExpandedModels(new Map())
+      setEditing(new Map())
+      setKeyDrafts({})
       setStatus('ready')
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error))
@@ -244,8 +266,6 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     }
   }
 
-  // The section interrogates the settings plane once on mount: the page the
-  // slot renders must show the stored configuration, not an eternal ellipsis.
   useEffect(() => { void load() }, [])
 
   const saved = (text: string): void => {
@@ -253,22 +273,26 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     void load()
   }
 
-  /**
-   * Refuse the save with a localized message when a row cannot be written:
-   * an empty or duplicate id, or capacity text that does not parse. The host
-   * re-judges the same constraints at the write; this names the row first.
-   */
+  /** Refuse the save when a group or model row cannot be written. */
   const catalogProblem = (): string | undefined => {
-    const seen = new Set<string>()
-    for (const [index, model] of models.entries()) {
-      const id = textOf(model, 'id').trim()
-      if (id.length === 0) return `${t('modelIdRequired')} (${t('models')} ${String(index + 1)})`
-      if (seen.has(id)) return `${t('modelIdDuplicate')} (${id})`
-      seen.add(id)
-      for (const field of ['contextWindow', 'maxTokens'] as const) {
-        const buffer = editing.get(bufferKey(index, field))
-        if (buffer !== undefined && Number.isNaN(parseCapacity(buffer) ?? 0)) {
-          return `${t('capacityInvalid')} (${id} · ${t(field)})`
+    const seenGroups = new Set<string>()
+    for (const [gIndex, group] of groups.entries()) {
+      const gid = textOf(group, 'id').trim()
+      if (gid.length === 0) return `${t('groupIdRequired')} (${t('groups')} ${String(gIndex + 1)})`
+      if (seenGroups.has(gid)) return `${t('groupIdDuplicate')} (${gid})`
+      seenGroups.add(gid)
+      const seen = new Set<string>()
+      for (const [index, model] of modelsOf(group).entries()) {
+        const id = textOf(model, 'id').trim()
+        if (id.length === 0) return `${t('modelIdRequired')} (${t('models')} ${String(index + 1)})`
+        if (seen.has(id)) return `${t('modelIdDuplicate')} (${id})`
+        seen.add(id)
+        for (const field of ['contextWindow', 'maxTokens'] as const) {
+          const groupEditing = editing.get(gid) ?? new Map<string, string>()
+          const buffer = groupEditing.get(bufferKey(index, field))
+          if (buffer !== undefined && Number.isNaN(parseCapacity(buffer) ?? 0)) {
+            return `${t('capacityInvalid')} (${id} · ${t(field)})`
+          }
         }
       }
     }
@@ -285,21 +309,15 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     setNotice(undefined)
     setErrorText(undefined)
     try {
-      const trimmedBase = baseURL.trim()
       const ops: SettingsPathOpView[] = []
-      if (trimmedBase.length > 0) ops.push({ op: 'set', path: ['baseURL'], value: trimmedBase })
-      else ops.push({ op: 'unset', path: ['baseURL'] })
-      ops.push({
-        op: 'set',
-        path: ['proxy'],
-        value: { enabled: proxyEnabled, url: proxyUrl.trim().length > 0 ? proxyUrl.trim() : DEFAULT_PROXY_URL },
-      })
-      ops.push({
-        op: 'set',
-        path: ['models'],
-        value: models.map(model => {
-          const id = textOf(model, 'id').trim()
-          const name = textOf(model, 'name').trim()
+      const serializedGroups = groups.map(group => {
+        const id = textOf(group, 'id').trim()
+        const name = textOf(group, 'name').trim()
+        const baseURL = textOf(group, 'baseURL').trim()
+        const proxy = proxies.get(id)
+        const models = modelsOf(group).map(model => {
+          const mid = textOf(model, 'id').trim()
+          const mname = textOf(model, 'name').trim()
           const contextWindow = numberOf(model, 'contextWindow')
           const maxTokens = numberOf(model, 'maxTokens')
           const efforts = Array.isArray(model.reasoningEfforts)
@@ -310,30 +328,50 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
             ? model.defaultReasoningEffort
             : undefined
           return {
-            id,
-            ...name.length > 0 ? { name } : {},
+            id: mid,
+            ...mname.length > 0 ? { name: mname } : {},
             ...contextWindow !== undefined ? { contextWindow } : {},
             ...maxTokens !== undefined ? { maxTokens } : {},
             ...efforts.length > 0 ? { reasoningEfforts: efforts } : {},
             ...preset !== undefined ? { defaultReasoningEffort: preset } : {},
+            ...model.vision === true ? { vision: true } : {},
           }
-        }),
+        })
+        return {
+          id,
+          ...name.length > 0 ? { name } : {},
+          ...baseURL.length > 0 ? { baseURL } : {},
+          ...apiTypeOf(group) === 'responses' ? { apiType: 'responses' as const } : {},
+          models,
+          ...proxy !== undefined ? {
+            proxy: {
+              enabled: proxy.enabled,
+              url: proxy.url.trim().length > 0 ? proxy.url.trim() : DEFAULT_PROXY_URL,
+            },
+          } : {},
+        }
       })
+      // Replace the whole groups array in one op; drop the legacy flat keys.
+      ops.push({ op: 'set', path: ['groups'], value: serializedGroups })
+      ops.push({ op: 'unset', path: ['baseURL'] })
+      ops.push({ op: 'unset', path: ['models'] })
       const mutated = await api.settings.mutate({ ns: NS, ops, expectedRevision: revision })
       if (!mutated.result.ok) {
         setErrorText(mutated.result.error.message)
         return
       }
       setRevision(mutated.result.value.revision)
-      const key = keyDraft.trim()
-      if (key.length > 0) {
-        const stored = await api.credentials.set({ ref: KEY_REF, value: key })
+      // Write each non-empty key draft to its group's credential ref.
+      for (const [ref, draft] of Object.entries(keyDrafts)) {
+        const key = draft.trim()
+        if (key.length === 0) continue
+        const stored = await api.credentials.set({ ref, value: key })
         if (!stored.result.ok) {
           setErrorText(stored.result.error.message)
           return
         }
-        setKeyDraft('')
       }
+      setKeyDrafts({})
       saved(t('saved'))
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error))
@@ -342,16 +380,163 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     }
   }
 
-  const fetchModels = async (): Promise<void> => {
+  // ── Group-level operations ───────────────────────────────────────────────
+
+  const patchGroup = (index: number, next: Record<string, unknown>): void => {
+    setGroups(current => current.map((group, at) => at === index ? { ...group, ...next } : group))
+  }
+
+  const addGroup = (): void => {
+    const id = `gw${String(groups.length + 1)}`
+    setGroups(current => [...current, { id, name: '', baseURL: '' }])
+    setExpandedGroups(current => new Set(current).add(id))
+  }
+
+  const removeGroup = (index: number): void => {
+    const id = textOf(groups[index] ?? {}, 'id')
+    setGroups(current => current.filter((_g, at) => at !== index))
+    if (id.length > 0) {
+      const nextExpanded = new Set(expandedGroups)
+      nextExpanded.delete(id)
+      setExpandedGroups(nextExpanded)
+    }
+  }
+
+  const toggleGroupExpanded = (id: string): void => {
+    setExpandedGroups(current => {
+      const next = new Set(current)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
+  }
+
+  /** Remap every per-group UI state from one group id to another when the id field is edited. */
+  const remapGroupId = (oldId: string, newId: string): void => {
+    if (oldId === newId) return
+    setExpandedGroups(current => {
+      const next = new Set(current)
+      if (next.has(oldId)) { next.delete(oldId); next.add(newId) }
+      return next
+    })
+    const remapMap = <T,>(current: ReadonlyMap<string, T>): ReadonlyMap<string, T> => {
+      if (!current.has(oldId)) return current
+      const next = new Map(current)
+      const value = next.get(oldId)
+      if (value !== undefined) next.set(newId, value)
+      next.delete(oldId)
+      return next
+    }
+    setExpandedModels(current => remapMap(current))
+    setEditing(current => remapMap(current))
+    setCandidates(current => remapMap(current))
+    setPicked(current => remapMap(current))
+    setProxies(current => remapMap(current))
+    setParams(current => remapMap(current))
+    setParamChoices(current => remapMap(current))
+  }
+
+  // ── Per-model operations (within one group) ──────────────────────────────
+
+  const patchModel = (gid: string, index: number, next: Record<string, string | number | boolean | string[] | undefined>): void => {
+    setGroups(current => current.map(group => {
+      if (textOf(group, 'id') !== gid) return group
+      const models = modelsOf(group).map((model, at) => {
+        if (at !== index) return model
+        const cleared = new Set(
+          Object.entries(next).filter(([, value]) => value === undefined || value === '').map(([key]) => key),
+        )
+        return Object.fromEntries(
+          Object.entries({ ...model, ...next }).filter(([key]) => !cleared.has(key)),
+        )
+      })
+      return { ...group, models }
+    }))
+  }
+
+  const toggleModelExpanded = (gid: string, index: number): void => {
+    setExpandedModels(current => {
+      const rows = new Set(current.get(gid) ?? new Set<number>())
+      if (!rows.delete(index)) rows.add(index)
+      return new Map(current).set(gid, rows)
+    })
+  }
+
+  const capacityText = (gid: string, model: ModelDraft, index: number, field: CapacityField): string =>
+    (editing.get(gid) ?? new Map<string, string>()).get(bufferKey(index, field))
+      ?? (numberOf(model, field) === undefined ? '' : formatCapacity(numberOf(model, field) as number))
+
+  const editCapacity = (gid: string, index: number, field: CapacityField, text: string): void => {
+    setEditing(current => {
+      const groupEditing = new Map(current.get(gid) ?? new Map<string, string>())
+      groupEditing.set(bufferKey(index, field), text)
+      return new Map(current).set(gid, groupEditing)
+    })
+    patchModel(gid, index, { [field]: parseCapacity(text) })
+  }
+
+  /** Reindex a group's edit buffers after a row removal. */
+  const reindexOnRemove = (current: ReadonlyMap<string, ReadonlyMap<string, string>>, gid: string, index: number): ReadonlyMap<string, ReadonlyMap<string, string>> => {
+    const groupEditing = current.get(gid)
+    if (groupEditing === undefined) return current
+    const next = new Map<string, string>()
+    for (const [key, value] of groupEditing) {
+      const at = Number(key.slice(0, key.indexOf(':')))
+      if (at === index) continue
+      next.set(at > index ? key.replace(/^\d+/, String(at - 1)) : key, value)
+    }
+    return new Map(current).set(gid, next)
+  }
+
+  const removeModel = (gid: string, index: number): void => {
+    setGroups(current => current.map(group => {
+      if (textOf(group, 'id') !== gid) return group
+      return { ...group, models: modelsOf(group).filter((_m, at) => at !== index) }
+    }))
+    setExpandedModels(current => {
+      const rows = current.get(gid)
+      if (rows === undefined) return current
+      const next = new Set<number>()
+      for (const at of rows) {
+        if (at < index) next.add(at)
+        else if (at > index) next.add(at - 1)
+      }
+      return new Map(current).set(gid, next)
+    })
+    setEditing(current => reindexOnRemove(current, gid, index))
+  }
+
+  const addModel = (gid: string): void => {
+    setGroups(current => current.map(group => {
+      if (textOf(group, 'id') !== gid) return group
+      return { ...group, models: [...modelsOf(group), { id: '' }] }
+    }))
+  }
+
+  const clearModels = (gid: string): void => {
+    setGroups(current => current.map(group => {
+      if (textOf(group, 'id') !== gid) return group
+      return { ...group, models: [] }
+    }))
+    setExpandedModels(current => new Map(current).set(gid, new Set()))
+    setEditing(current => new Map(current).set(gid, new Map()))
+    setParams(current => new Map(current).set(gid, undefined as never))
+    setParamChoices(current => new Map(current).set(gid, new Map()))
+  }
+
+  // ── Per-group model discovery + models.dev params ────────────────────────
+
+  const fetchModels = async (gid: string): Promise<void> => {
     setBusy(true)
     setErrorText(undefined)
-    setCandidates(undefined)
+    setCandidates(current => new Map(current).set(gid, undefined as never))
     try {
-      const key = keyDraft.trim()
+      const group = groups.find(g => textOf(g, 'id') === gid)
+      const baseURL = textOf(group ?? {}, 'baseURL').trim()
+      const key = (keyDrafts[groupCredRef(gid)] ?? '').trim()
       const response = await api.llm.discoverModels({
         settingsNs: NS,
-        provider: 'newapi',
-        ...baseURL.trim().length > 0 ? { baseURL: baseURL.trim() } : {},
+        provider: groupRoute(gid),
+        ...baseURL.length > 0 ? { baseURL } : {},
         ...key.length > 0 ? { apiKey: key } : {},
       })
       if (!response.result.ok) {
@@ -359,18 +544,15 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         return
       }
       const found = response.result.value.models
-      // Sorted by id regardless of what the host answered, so the picker and
-      // the rows it produces read the same way on every fetch.
       found.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
       if (found.length === 0) {
         setErrorText(t('fetchEmpty'))
         return
       }
-      // Everything already configured starts unchecked, so adopting a
-      // selection never silently rewrites a capacity the user corrected.
-      const known = new Set(models.map(model => textOf(model, 'id')))
-      setCandidates(found)
-      setPicked(new Set(found.filter(model => !known.has(model.id)).map(model => model.id)))
+      const groupModels = toModelDrafts(group?.models)
+      const known = new Set(groupModels.map(model => textOf(model, 'id')))
+      setCandidates(current => new Map(current).set(gid, found))
+      setPicked(current => new Map(current).set(gid, new Set(found.filter(model => !known.has(model.id)).map(model => model.id))))
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error))
     } finally {
@@ -378,12 +560,14 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     }
   }
 
-  const adopt = (): void => {
-    if (candidates === undefined) return
-    const existing = new Map(models.map(model => [textOf(model, 'id'), model]))
-    for (const candidate of candidates) {
-      if (!picked.has(candidate.id)) continue
-      // A row the user already tuned wins over the gateway's own numbers.
+  const adopt = (gid: string): void => {
+    const found = candidates.get(gid)
+    if (found === undefined) return
+    const group = groups.find(g => textOf(g, 'id') === gid)
+    const existing = new Map(modelsOf(group ?? {}).map(model => [textOf(model, 'id'), model]))
+    const selected = picked.get(gid) ?? new Set<string>()
+    for (const candidate of found) {
+      if (!selected.has(candidate.id)) continue
       if (existing.has(candidate.id)) continue
       existing.set(candidate.id, {
         id: candidate.id,
@@ -392,51 +576,50 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         ...candidate.maxTokens === undefined ? {} : { maxTokens: candidate.maxTokens },
       })
     }
-    // The form keeps id order after an adoption: new and old rows merge
-    // into one alphabetized list instead of new rows appending at the end.
-    // Rows whose id is still empty are not yet models and stay at the bottom.
-    setModels([...existing.values()].sort((a, b) => {
+    const merged = [...existing.values()].sort((a, b) => {
       const ai = textOf(a, 'id').trim()
       const bi = textOf(b, 'id').trim()
       if (ai.length === 0) return bi.length === 0 ? 0 : 1
       if (bi.length === 0) return -1
       return ai < bi ? -1 : ai > bi ? 1 : 0
-    }))
-    setCandidates(undefined)
-    setPicked(new Set())
+    })
+    patchGroup(groups.findIndex(g => textOf(g, 'id') === gid), { models: merged })
+    setCandidates(current => new Map(current).set(gid, undefined as never))
+    setPicked(current => new Map(current).set(gid, new Set()))
   }
 
-  const toggle = (id: string): void => {
+  const toggle = (gid: string, id: string): void => {
     setPicked(current => {
-      const next = new Set(current)
+      const next = new Set(current.get(gid) ?? new Set<string>())
       if (!next.delete(id)) next.add(id)
-      return next
+      return new Map(current).set(gid, next)
     })
   }
 
-  /** Ask the host (via the RPC face) what models.dev knows about the rows. */
-  const updateParams = async (): Promise<void> => {
-    const ids = models.map(model => textOf(model, 'id').trim()).filter(id => id.length > 0)
+  /** Ask the host what models.dev knows about one group's rows. */
+  const updateParams = async (gid: string): Promise<void> => {
+    const group = groups.find(g => textOf(g, 'id') === gid)
+    const ids = modelsOf(group ?? {}).map(model => textOf(model, 'id').trim()).filter(id => id.length > 0)
     if (ids.length === 0) {
       setErrorText(t('paramsNoModels'))
       return
     }
+    const proxy = proxies.get(gid)
     setParamsBusy(true)
     setErrorText(undefined)
-    setParams(undefined)
+    setParams(current => new Map(current).set(gid, undefined as never))
     try {
       const response = await props.fetchModelParams({
+        provider: groupRoute(gid),
         modelIds: ids,
-        ...proxyEnabled && proxyUrl.trim().length > 0 ? { proxyUrl: proxyUrl.trim() } : {},
+        ...proxy !== undefined && proxy.enabled && proxy.url.trim().length > 0 ? { proxyUrl: proxy.url.trim() } : {},
       })
       if (!response.ok) {
         setErrorText(response.error.message)
         return
       }
-      setParams(response.value)
-      setParamChoices(new Map())
-      // Completion feedback next to the action, not only in the panel the
-      // user may have to hunt for: matched/unmatched counts as a status line.
+      setParams(current => new Map(current).set(gid, response.value))
+      setParamChoices(current => new Map(current).set(gid, new Map()))
       const matched = response.value.models.filter(entry => entry.matches.length > 0).length
       setNotice(
         t('paramsSummary')
@@ -450,24 +633,20 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     }
   }
 
-  /** The match a panel row currently shows: the user's choice, else the first. */
-  const chosenMatch = (entry: { id: string; matches: ModelsDevParamsResponse['models'][number]['matches'] }) =>
-    entry.matches[paramChoices.get(entry.id) ?? 0] ?? entry.matches[0]
+  const chosenMatch = (gid: string, entry: { id: string; matches: ModelsDevParamsResponse['models'][number]['matches'] }) =>
+    entry.matches[(paramChoices.get(gid) ?? new Map<string, number>()).get(entry.id) ?? 0] ?? entry.matches[0]
 
-  /**
-   * Apply the panel's chosen matches to the rows: overwrite mode replaces
-   * the capacities the catalog provides; blank mode only fills empty fields.
-   * Ids with no match keep their stored values.
-   * @param overwrite - whether existing values are replaced.
-   */
-  const applyParams = (overwrite: boolean): void => {
-    if (params === undefined) return
-    const byId = new Map(params.models.map(entry => [entry.id, entry]))
+  /** Apply the panel's chosen matches to the rows. */
+  const applyParams = (gid: string, overwrite: boolean): void => {
+    const groupParams = params.get(gid)
+    if (groupParams === undefined) return
+    const byId = new Map(groupParams.models.map(entry => [entry.id, entry]))
     let touched = 0
-    const next = models.map(model => {
+    const group = groups.find(g => textOf(g, 'id') === gid)
+    const next = modelsOf(group ?? {}).map(model => {
       const id = textOf(model, 'id').trim()
       const entry = byId.get(id)
-      const match = entry === undefined || entry.matches.length === 0 ? undefined : chosenMatch(entry)
+      const match = entry === undefined || entry.matches.length === 0 ? undefined : chosenMatch(gid, entry)
       if (match === undefined) return model
       const nextContext = match.contextWindow
       const nextMax = match.maxTokens
@@ -478,77 +657,21 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       const takeContext = nextContext !== undefined && (overwrite || currentContext === undefined)
       const takeMax = nextMax !== undefined && (overwrite || currentMax === undefined)
       const takeEfforts = nextEfforts !== undefined && nextEfforts.length > 0 && (overwrite || !hasEfforts)
-      if (!takeContext && !takeMax && !takeEfforts) return model
+      const takeVision = match.vision === true && (overwrite || model.vision !== true)
+      if (!takeContext && !takeMax && !takeEfforts && !takeVision) return model
       touched += 1
       return {
         ...model,
         ...takeContext && nextContext !== undefined ? { contextWindow: nextContext } : {},
         ...takeMax && nextMax !== undefined ? { maxTokens: nextMax } : {},
         ...takeEfforts && nextEfforts !== undefined ? { reasoningEfforts: nextEfforts } : {},
+        ...takeVision ? { vision: true } : {},
       }
     })
-    setModels(next)
-    setParams(undefined)
-    setParamChoices(new Map())
+    patchGroup(groups.findIndex(g => textOf(g, 'id') === gid), { models: next })
+    setParams(current => new Map(current).set(gid, undefined as never))
+    setParamChoices(current => new Map(current).set(gid, new Map()))
     setNotice(`${t('paramsApplied')} (${String(touched)})`)
-  }
-
-  /** Replace one row, dropping optional fields the edit emptied. */
-  const patch = (index: number, next: Record<string, string | number | undefined>): void => {
-    setModels(current => current.map((model, at) => {
-      if (at !== index) return model
-      const cleared = new Set(
-        Object.entries(next).filter(([, value]) => value === undefined || value === '').map(([key]) => key),
-      )
-      return Object.fromEntries(
-        Object.entries({ ...model, ...next }).filter(([key]) => !cleared.has(key)),
-      )
-    }))
-  }
-
-  const toggleExpanded = (index: number): void => {
-    setExpanded(current => {
-      const next = new Set(current)
-      if (!next.delete(index)) next.add(index)
-      return next
-    })
-  }
-
-  /** What a capacity field shows: the buffer while typing, else the stored count. */
-  const capacityText = (model: ModelDraft, index: number, field: CapacityField): string =>
-    editing.get(bufferKey(index, field))
-      ?? (numberOf(model, field) === undefined ? '' : formatCapacity(numberOf(model, field) as number))
-
-  const editCapacity = (index: number, field: CapacityField, text: string): void => {
-    setEditing(current => new Map(current).set(bufferKey(index, field), text))
-    patch(index, { [field]: parseCapacity(text) })
-  }
-
-  /** Drop one row's entries and shift the rows after it down, in one pass. */
-  const reindexOnRemove = (current: ReadonlyMap<string, string>, index: number): Map<string, string> => {
-    const next = new Map<string, string>()
-    for (const [key, value] of current) {
-      const at = Number(key.slice(0, key.indexOf(':')))
-      if (at === index) continue
-      // Only the row number moves; the field half of the key is untouched.
-      next.set(at > index ? key.replace(/^\d+/, String(at - 1)) : key, value)
-    }
-    return next
-  }
-
-  const removeModel = (index: number): void => {
-    setModels(current => current.filter((_model, at) => at !== index))
-    // Both stores are keyed by position, so every row after this one shifts
-    // down and would otherwise inherit its neighbour's state.
-    setExpanded(current => {
-      const next = new Set<number>()
-      for (const at of current) {
-        if (at < index) next.add(at)
-        else if (at > index) next.add(at - 1)
-      }
-      return next
-    })
-    setEditing(current => reindexOnRemove(current, index))
   }
 
   if (status === 'loading') return <section aria-label={t('nav')}><p>…</p></section>
@@ -563,265 +686,381 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
 
   return (
     <section aria-label={t('nav')}>
-      <p>{t('intro')}</p>
+      <p className="newapi-intro">{t('intro')}</p>
       {notice === undefined ? null : <p role="status">{notice}</p>}
       {!writable ? <p>{t('readOnly')}</p> : null}
       {errorText === undefined ? null : <p className="newapi-error">{errorText}</p>}
 
-      <div className="newapi-field">
-        <label htmlFor="newapi-key">{t('keyInput')}</label>
-        {/* The official ProviderEditor credential pattern: a read-only
-            credential (launch environment) locks the input and the
-            placeholder states the fact; no separate hint paragraph. */}
-        <input
-          id="newapi-key" type="password" autoComplete="off" className="newapi-input"
-          disabled={keyLocked}
-          placeholder={keyLocked
-            ? t('keyEnvLocked')
-            : keyConfigured === true ? t('keyStored') : keyConfigured === false ? t('keyMissing') : t('keyPlaceholder')}
-          value={keyDraft}
-          onChange={(event) => { setKeyDraft(event.target.value) }}
-        />
-      </div>
+      <div className="newapi-groups">
+        {groups.length === 0 ? <p className="newapi-empty">{t('noGroups')}</p> : null}
+        {groups.map((group, index) => {
+          const gid = textOf(group, 'id').trim()
+          const ref = groupCredRef(gid.length > 0 ? gid : 'newapi')
+          const cred = credentials[ref]
+          const expanded = expandedGroups.has(gid)
+          const groupModels = modelsOf(group)
+          const groupProxy = proxies.get(gid) ?? { enabled: false, url: DEFAULT_PROXY_URL }
+          const groupParams = params.get(gid)
+          const groupCandidates = candidates.get(gid)
+          const keyDraft = keyDrafts[ref] ?? ''
 
-      <div className="newapi-field">
-        <label htmlFor="newapi-base">{t('baseUrl')}</label>
-        <input
-          id="newapi-base" type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
-          value={baseURL}
-          onChange={(event) => { setBaseURL(event.target.value) }}
-        />
-      </div>
-
-      <section className="newapi-catalog" aria-label={t('models')}>
-        <div className="newapi-catalog-head">
-          <span className="newapi-catalog-title">{t('models')}</span>
-          <div className="newapi-catalog-actions" style={{ display: 'flex', gap: 4 }}>
-            <button type="button" className="newapi-linkbutton" disabled={busy} onClick={() => { void fetchModels() }}>
-              {busy ? t('fetching') : t('fetchModels')}
-            </button>
-            <button type="button" className="newapi-linkbutton" disabled={paramsBusy} onClick={() => { void updateParams() }}>
-              {paramsBusy ? t('paramsFetching') : t('updateParams')}
-            </button>
-            {/* Same state semantics as the per-row delete glyph, applied to
-                every row at once: the merged position-keyed stores reset too,
-                so no stale disclosure or buffer survives into new rows. */}
-            <button type="button" className="newapi-linkbutton" disabled={busy || models.length === 0} onClick={() => {
-              setModels([])
-              setExpanded(new Set())
-              setEditing(new Map())
-              setParams(undefined)
-              setParamChoices(new Map())
-            }}>
-              {t('clearModels')}
-            </button>
-          </div>
-        </div>
-        <div className="newapi-proxyrow">
-          <label>
-            <input
-              type="checkbox" checked={proxyEnabled}
-              aria-label={t('proxyToggle')}
-              onChange={(event) => { setProxyEnabled(event.target.checked) }}
-            />
-            {t('proxyToggle')}
-          </label>
-          {proxyEnabled
-            ? (
-              <input
-                className="newapi-input" type="text" style={{ maxWidth: 220 }}
-                aria-label={t('proxyUrl')} placeholder={DEFAULT_PROXY_URL}
-                value={proxyUrl}
-                onChange={(event) => { setProxyUrl(event.target.value) }}
-              />
-            )
-            : null}
-        </div>
-        {models.length === 0 ? <p className="newapi-empty">{t('modelsEmpty')}</p> : null}
-        {models.map((model, index) => (
-          <div key={index} className="newapi-entry">
-            <div className="newapi-modelrow">
-              <input
-                className="newapi-input" type="text" value={textOf(model, 'id')}
-                placeholder={t('modelId')} aria-label={`${t('modelId')} ${String(index + 1)}`}
-                onChange={(event) => { patch(index, { id: event.target.value }) }}
-              />
-              <input
-                className="newapi-input" type="text" value={textOf(model, 'name')}
-                placeholder={t('modelName')} aria-label={`${t('modelName')} ${String(index + 1)}`}
-                onChange={(event) => { patch(index, { name: event.target.value === '' ? undefined : event.target.value }) }}
-              />
-              <button
-                type="button" className="newapi-iconbutton"
-                aria-label={`${t('modelAdvanced')} ${String(index + 1)}`}
-                aria-expanded={expanded.has(index)}
-                title={t('modelAdvanced')}
-                onClick={() => { toggleExpanded(index) }}
-              >
-                <IconChevron open={expanded.has(index)} />
-              </button>
-              <button
-                type="button" className="newapi-iconbutton newapi-iconbutton--danger"
-                aria-label={`${t('removeModel')} ${String(index + 1)}`}
-                title={t('removeModel')}
-                onClick={() => { removeModel(index) }}
-              >
-                <IconTrash />
-              </button>
-            </div>
-            {expanded.has(index)
-              ? (
-                <div className="newapi-modeladvanced">
-                  <label className="newapi-modelfield">
-                    <span className="newapi-modelfield-label">{t('contextWindow')}</span>
-                    <input
-                      className="newapi-input" type="text" inputMode="numeric"
-                      value={capacityText(model, index, 'contextWindow')}
-                      placeholder={CAPACITY_HINT.contextWindow}
-                      aria-label={`${t('contextWindow')} ${String(index + 1)}`}
-                      onChange={(event) => { editCapacity(index, 'contextWindow', event.target.value) }}
-                    />
-                  </label>
-                  <label className="newapi-modelfield">
-                    <span className="newapi-modelfield-label">{t('maxTokens')}</span>
-                    <input
-                      className="newapi-input" type="text" inputMode="numeric"
-                      value={capacityText(model, index, 'maxTokens')}
-                      placeholder={CAPACITY_HINT.maxTokens}
-                      aria-label={`${t('maxTokens')} ${String(index + 1)}`}
-                      onChange={(event) => { editCapacity(index, 'maxTokens', event.target.value) }}
-                    />
-                  </label>
-                  {Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length > 0
-                    ? (
-                      <label className="newapi-modelfield">
-                        <span className="newapi-modelfield-label">{t('modelReasoning')}</span>
-                        <select
-                          className="newapi-select"
-                          aria-label={`${t('defaultEffort')} ${String(index + 1)}`}
-                          value={typeof model.defaultReasoningEffort === 'string'
-                            && model.reasoningEfforts.includes(model.defaultReasoningEffort)
-                            ? model.defaultReasoningEffort
-                            : highestOf(model.reasoningEfforts)}
-                          onChange={(event) => {
-                            patch(index, { defaultReasoningEffort: event.target.value })
-                          }}
-                        >
-                          {model.reasoningEfforts.map((effort) => (
-                            <option key={effort} value={effort}>{effort}</option>
-                          ))}
-                        </select>
-                      </label>
-                    )
-                    : null}
-                </div>
-              )
-              : null}
-          </div>
-        ))}
-        <button
-          type="button" className="newapi-addmodel"
-          disabled={busy}
-          onClick={() => { setModels(current => [...current, { id: '' }]) }}
-        >
-          {t('addModel')}
-        </button>
-      </section>
-
-      {candidates === undefined ? null : (
-        <div className="newapi-candidates">
-          <strong>{t('fetchTitle')}</strong>
-          <ul>
-            {candidates.map(model => (
-              <li key={model.id}>
-                <label>
-                  <input
-                    type="checkbox" checked={picked.has(model.id)}
-                    onChange={() => { toggle(model.id) }}
-                  />
-                  {' '}
-                  {model.id}{model.name === undefined || model.name === model.id ? '' : ` (${model.name})`}
-                </label>
-              </li>
-            ))}
-          </ul>
-          <button type="button" className="newapi-button newapi-button--primary" disabled={picked.size === 0} onClick={adopt}>
-            {t('fetchAdopt')}
-          </button>
-          {' '}
-          <button type="button" className="newapi-button" onClick={() => { setCandidates(undefined); setPicked(new Set()) }}>
-            {t('fetchCancel')}
-          </button>
-        </div>
-      )}
-
-      {params === undefined ? null : (
-        <div className="newapi-params" ref={paramsRef}>
-          <strong>{t('paramsTitle')}</strong>
-          <p className="newapi-params-summary">{
-            t('paramsSummary')
-              .replace('{matched}', String(params.models.filter(entry => entry.matches.length > 0).length))
-              .replace('{unmatched}', String(params.models.filter(entry => entry.matches.length === 0).length))
-          }</p>
-          {params.models.map(entry => {
-            if (entry.matches.length === 0) {
-              return (
-                <div key={entry.id} className="newapi-params-row">
-                  <span className="newapi-params-id">{entry.id}</span>
-                  <span className="newapi-params-unmatched">{t('paramsUnmatched')}</span>
-                  <span />
-                </div>
-              )
-            }
-            if (entry.matches.length === 1) {
-              const match = entry.matches[0]
-              if (match === undefined) return null
-              return (
-                <div key={entry.id} className="newapi-params-row">
-                  <span className="newapi-params-id">{entry.id}</span>
-                  <span className="newapi-params-values">
-                    {`${match.official === true ? `${t('officialMark')} · ` : ''}${match.provider} · ${t('contextWindow')} ${match.contextWindow ?? '—'} / ${t('maxTokens')} ${match.maxTokens ?? '—'}${match.reasoningEfforts !== undefined && match.reasoningEfforts.length > 0 ? ` · ${t('modelReasoning')}: ${match.reasoningEfforts.join('/')}` : ''}`}
-                  </span>
-                  <span />
-                </div>
-              )
-            }
-            const chosen = paramChoices.get(entry.id) ?? 0
-            const match = entry.matches[chosen] ?? entry.matches[0]
-            if (match === undefined) return null
-            return (
-              <div key={entry.id} className="newapi-params-row">
-                <span className="newapi-params-id">{entry.id}</span>
-                <select
-                  className="newapi-select" aria-label={`${t('paramsProvider')} ${entry.id}`}
-                  value={String(chosen)}
-                  onChange={(event) => {
-                    setParamChoices(current => new Map(current).set(entry.id, Number(event.target.value)))
-                  }}
+          return (
+            <div key={index} className="newapi-group">
+              <div className="newapi-group-head">
+                <button
+                  type="button" className="newapi-group-toggle"
+                  aria-label={expanded ? t('groupCollapsed') : t('groupExpanded')}
+                  aria-expanded={expanded}
+                  onClick={() => { toggleGroupExpanded(gid) }}
                 >
-                  {entry.matches.map((candidate, at) => (
-                    <option key={candidate.provider} value={String(at)}>
-                      {`${candidate.official === true ? `${t('officialMark')} · ` : ''}${candidate.provider}: ${t('contextWindow')} ${candidate.contextWindow ?? '—'} / ${t('maxTokens')} ${candidate.maxTokens ?? '—'}${candidate.reasoningEfforts !== undefined && candidate.reasoningEfforts.length > 0 ? ` · ${t('modelReasoning')}: ${candidate.reasoningEfforts.join('/')}` : ''}`}
-                    </option>
-                  ))}
-                </select>
-                <span className="newapi-params-values">{match.provider}</span>
+                  <IconChevron open={expanded} />
+                </button>
+                <input
+                  className="newapi-input newapi-group-name" type="text"
+                  placeholder={t('groupNamePlaceholder')} value={textOf(group, 'name')}
+                  aria-label={`${t('groupName')} ${String(index + 1)}`}
+                  onChange={(event) => { patchGroup(index, { name: event.target.value }) }}
+                />
+                <span className="newapi-badge" title={t('groupRoute')}>{groupRoute(gid)}</span>
+                {apiTypeOf(group) === 'responses' ? <span className="newapi-badge" title={t('apiTypeResponsesHint')}>{t('apiTypeResponses')}</span> : null}
+                <span className={`newapi-statusdot ${cred?.configured === true ? 'newapi-statusdot--ok' : 'newapi-statusdot--warn'}`}
+                  title={cred?.configured === true ? t('keyStored') : t('keyMissing')} />
+                <span className="newapi-count">{`${String(groupModels.length)} ${t('models')}`}</span>
+                <button
+                  type="button" className="newapi-iconbutton newapi-iconbutton--danger"
+                  aria-label={`${t('removeGroup')} ${String(index + 1)}`}
+                  title={t('removeGroup')}
+                  onClick={() => { removeGroup(index) }}
+                >
+                  <IconTrash />
+                </button>
               </div>
-            )
-          })}
-          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-            <button type="button" className="newapi-button newapi-button--primary" onClick={() => { applyParams(true) }}>
-              {t('paramsOverwrite')}
-            </button>
-            <button type="button" className="newapi-button" onClick={() => { applyParams(false) }}>
-              {t('paramsFillBlank')}
-            </button>
-            <button type="button" className="newapi-button" onClick={() => { setParams(undefined); setParamChoices(new Map()) }}>
-              {t('fetchCancel')}
-            </button>
-          </div>
-        </div>
-      )}
+
+              {expanded
+                ? (
+                  <div className="newapi-group-body">
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-id-${index}`}>{t('groupId')}</label>
+                      <input
+                        id={`newapi-id-${index}`} type="text" className="newapi-input"
+                        placeholder={t('groupIdPlaceholder')} value={textOf(group, 'id')}
+                        aria-label={`${t('groupId')} ${String(index + 1)}`}
+                        onChange={(event) => {
+                          const oldId = textOf(group, 'id')
+                          patchGroup(index, { id: event.target.value })
+                          remapGroupId(oldId, event.target.value)
+                        }}
+                      />
+                    </div>
+
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-key-${index}`}>{t('keyInput')}</label>
+                      <input
+                        id={`newapi-key-${index}`} type="password" autoComplete="off" className="newapi-input"
+                        disabled={cred?.locked === true}
+                        aria-label={`${t('keyInput')} ${String(index + 1)}`}
+                        placeholder={cred?.locked === true
+                          ? t('keyEnvLocked')
+                          : cred?.configured === true ? t('keyStored') : t('keyMissing')}
+                        value={keyDraft}
+                        onChange={(event) => {
+                          setKeyDrafts(current => ({ ...current, [ref]: event.target.value }))
+                        }}
+                      />
+                    </div>
+
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
+                      <input
+                        id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
+                        value={textOf(group, 'baseURL')}
+                        aria-label={`${t('baseUrl')} ${String(index + 1)}`}
+                        onChange={(event) => { patchGroup(index, { baseURL: event.target.value }) }}
+                      />
+                    </div>
+
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-type-${index}`}>{t('apiType')}</label>
+                      <select
+                        id={`newapi-type-${index}`} className="newapi-select"
+                        aria-label={`${t('apiType')} ${String(index + 1)}`}
+                        value={apiTypeOf(group)}
+                        onChange={(event) => { patchGroup(index, { apiType: event.target.value }) }}
+                      >
+                        <option value="chat">{t('apiTypeChat')}</option>
+                        <option value="responses">{t('apiTypeResponses')}</option>
+                      </select>
+                      {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
+                    </div>
+
+                    <div className="newapi-proxyrow">
+                      <label>
+                        <input
+                          type="checkbox" checked={groupProxy.enabled}
+                          aria-label={`${t('proxyToggle')} ${String(index + 1)}`}
+                          onChange={(event) => {
+                            setProxies(current => new Map(current).set(gid, { ...groupProxy, enabled: event.target.checked }))
+                          }}
+                        />
+                        {t('proxyToggle')}
+                      </label>
+                      {groupProxy.enabled
+                        ? (
+                          <input
+                            className="newapi-input" type="text" style={{ maxWidth: 220 }}
+                            aria-label={`${t('proxyUrl')} ${String(index + 1)}`} placeholder={DEFAULT_PROXY_URL}
+                            value={groupProxy.url}
+                            onChange={(event) => {
+                              setProxies(current => new Map(current).set(gid, { ...groupProxy, url: event.target.value }))
+                            }}
+                          />
+                        )
+                        : null}
+                    </div>
+
+                    <section className="newapi-catalog" aria-label={`${t('models')} ${String(index + 1)}`}>
+                      <div className="newapi-catalog-head">
+                        <span className="newapi-catalog-title">{t('models')}</span>
+                        <div className="newapi-catalog-actions" style={{ display: 'flex', gap: 4 }}>
+                          <button type="button" className="newapi-linkbutton" disabled={busy} onClick={() => { void fetchModels(gid) }}>
+                            {busy ? t('fetching') : t('fetchModels')}
+                          </button>
+                          <button type="button" className="newapi-linkbutton" disabled={paramsBusy} onClick={() => { void updateParams(gid) }}>
+                            {paramsBusy ? t('paramsFetching') : t('updateParams')}
+                          </button>
+                          <button type="button" className="newapi-linkbutton" disabled={busy || groupModels.length === 0} onClick={() => { clearModels(gid) }}>
+                            {t('clearModels')}
+                          </button>
+                        </div>
+                      </div>
+                      {groupModels.length === 0 ? <p className="newapi-empty">{t('modelsEmpty')}</p> : null}
+                      {groupModels.map((model, mIndex) => {
+                        const rowExpanded = (expandedModels.get(gid) ?? new Set<number>()).has(mIndex)
+                        return (
+                          <div key={mIndex} className="newapi-entry">
+                            <div className="newapi-modelrow">
+                              <input
+                                className="newapi-input" type="text" value={textOf(model, 'id')}
+                                placeholder={t('modelId')} aria-label={`${t('modelId')} ${String(mIndex + 1)}`}
+                                onChange={(event) => { patchModel(gid, mIndex, { id: event.target.value }) }}
+                              />
+                              <input
+                                className="newapi-input" type="text" value={textOf(model, 'name')}
+                                placeholder={t('modelName')} aria-label={`${t('modelName')} ${String(mIndex + 1)}`}
+                                onChange={(event) => { patchModel(gid, mIndex, { name: event.target.value === '' ? undefined : event.target.value }) }}
+                              />
+                              <label className="newapi-vision" title={t('visionHint')}>
+                                <input
+                                  type="checkbox" checked={model.vision === true}
+                                  aria-label={`${t('vision')} ${String(mIndex + 1)}`}
+                                  onChange={(event) => { patchModel(gid, mIndex, { vision: event.target.checked }) }}
+                                />
+                                {t('vision')}
+                              </label>
+                              <button
+                                type="button" className="newapi-iconbutton"
+                                aria-label={`${t('modelAdvanced')} ${String(mIndex + 1)}`}
+                                aria-expanded={rowExpanded}
+                                title={t('modelAdvanced')}
+                                onClick={() => { toggleModelExpanded(gid, mIndex) }}
+                              >
+                                <IconChevron open={rowExpanded} />
+                              </button>
+                              <button
+                                type="button" className="newapi-iconbutton newapi-iconbutton--danger"
+                                aria-label={`${t('removeModel')} ${String(mIndex + 1)}`}
+                                title={t('removeModel')}
+                                onClick={() => { removeModel(gid, mIndex) }}
+                              >
+                                <IconTrash />
+                              </button>
+                            </div>
+                            {rowExpanded
+                              ? (
+                                <div className="newapi-modeladvanced">
+                                  <label className="newapi-modelfield">
+                                    <span className="newapi-modelfield-label">{t('contextWindow')}</span>
+                                    <input
+                                      className="newapi-input" type="text" inputMode="numeric"
+                                      value={capacityText(gid, model, mIndex, 'contextWindow')}
+                                      placeholder={CAPACITY_HINT.contextWindow}
+                                      aria-label={`${t('contextWindow')} ${String(mIndex + 1)}`}
+                                      onChange={(event) => { editCapacity(gid, mIndex, 'contextWindow', event.target.value) }}
+                                    />
+                                  </label>
+                                  <label className="newapi-modelfield">
+                                    <span className="newapi-modelfield-label">{t('maxTokens')}</span>
+                                    <input
+                                      className="newapi-input" type="text" inputMode="numeric"
+                                      value={capacityText(gid, model, mIndex, 'maxTokens')}
+                                      placeholder={CAPACITY_HINT.maxTokens}
+                                      aria-label={`${t('maxTokens')} ${String(mIndex + 1)}`}
+                                      onChange={(event) => { editCapacity(gid, mIndex, 'maxTokens', event.target.value) }}
+                                    />
+                                  </label>
+                                  <label className="newapi-modelfield">
+                                    <span className="newapi-modelfield-label">{t('reasoningEfforts')}</span>
+                                    <input
+                                      className="newapi-input" type="text"
+                                      placeholder={t('reasoningEffortsPlaceholder')}
+                                      aria-label={`${t('reasoningEfforts')} ${String(mIndex + 1)}`}
+                                      value={Array.isArray(model.reasoningEfforts)
+                                        ? model.reasoningEfforts.filter((e): e is string => typeof e === 'string').join(', ')
+                                        : ''}
+                                      onChange={(event) => {
+                                        const efforts = event.target.value.split(',')
+                                          .map(part => part.trim())
+                                          .filter(part => part.length > 0)
+                                        patchModel(gid, mIndex, { reasoningEfforts: efforts.length > 0 ? efforts : undefined })
+                                      }}
+                                    />
+                                  </label>
+                                  {Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length > 0
+                                    ? (
+                                      <label className="newapi-modelfield">
+                                        <span className="newapi-modelfield-label">{t('defaultEffort')}</span>
+                                        <select
+                                          className="newapi-select"
+                                          aria-label={`${t('defaultEffort')} ${String(mIndex + 1)}`}
+                                          value={typeof model.defaultReasoningEffort === 'string'
+                                            && model.reasoningEfforts.includes(model.defaultReasoningEffort)
+                                            ? model.defaultReasoningEffort
+                                            : highestOf(model.reasoningEfforts)}
+                                          onChange={(event) => {
+                                            patchModel(gid, mIndex, { defaultReasoningEffort: event.target.value })
+                                          }}
+                                        >
+                                          {model.reasoningEfforts.map((effort) => (
+                                            <option key={effort} value={effort}>{effort}</option>
+                                          ))}
+                                        </select>
+                                      </label>
+                                    )
+                                    : null}
+                                </div>
+                              )
+                              : null}
+                          </div>
+                        )
+                      })}
+                      <button
+                        type="button" className="newapi-addmodel"
+                        disabled={busy}
+                        onClick={() => { addModel(gid) }}
+                      >
+                        <IconPlus /> {t('addModel')}
+                      </button>
+                    </section>
+
+                    {groupCandidates === undefined ? null : (
+                      <div className="newapi-candidates">
+                        <strong>{t('fetchTitle')}</strong>
+                        <ul>
+                          {groupCandidates.map(model => (
+                            <li key={model.id}>
+                              <label>
+                                <input
+                                  type="checkbox" checked={(picked.get(gid) ?? new Set<string>()).has(model.id)}
+                                  onChange={() => { toggle(gid, model.id) }}
+                                />
+                                {' '}
+                                {model.id}{model.name === undefined || model.name === model.id ? '' : ` (${model.name})`}
+                              </label>
+                            </li>
+                          ))}
+                        </ul>
+                        <button type="button" className="newapi-button newapi-button--primary" disabled={(picked.get(gid) ?? new Set<string>()).size === 0} onClick={() => { adopt(gid) }}>
+                          {t('fetchAdopt')}
+                        </button>
+                        {' '}
+                        <button type="button" className="newapi-button" onClick={() => { setCandidates(current => new Map(current).set(gid, undefined as never)); setPicked(current => new Map(current).set(gid, new Set())) }}>
+                          {t('fetchCancel')}
+                        </button>
+                      </div>
+                    )}
+
+                    {groupParams === undefined ? null : (
+                      <div className="newapi-params" ref={paramsRef}>
+                        <strong>{t('paramsTitle')}</strong>
+                        <p className="newapi-params-summary">{
+                          t('paramsSummary')
+                            .replace('{matched}', String(groupParams.models.filter(entry => entry.matches.length > 0).length))
+                            .replace('{unmatched}', String(groupParams.models.filter(entry => entry.matches.length === 0).length))
+                        }</p>
+                        {groupParams.models.map(entry => {
+                          if (entry.matches.length === 0) {
+                            return (
+                              <div key={entry.id} className="newapi-params-row">
+                                <span className="newapi-params-id">{entry.id}</span>
+                                <span className="newapi-params-unmatched">{t('paramsUnmatched')}</span>
+                                <span />
+                              </div>
+                            )
+                          }
+                          if (entry.matches.length === 1) {
+                            const match = entry.matches[0]
+                            if (match === undefined) return null
+                            return (
+                              <div key={entry.id} className="newapi-params-row">
+                                <span className="newapi-params-id">{entry.id}</span>
+                                <span className="newapi-params-values">
+                                  {`${match.official === true ? `${t('officialMark')} · ` : ''}${match.provider} · ${t('contextWindow')} ${match.contextWindow ?? '—'} / ${t('maxTokens')} ${match.maxTokens ?? '—'}${match.vision === true ? ` · ${t('vision')}` : ''}${match.reasoningEfforts !== undefined && match.reasoningEfforts.length > 0 ? ` · ${t('modelReasoning')}: ${match.reasoningEfforts.join('/')}` : ''}`}
+                                </span>
+                                <span />
+                              </div>
+                            )
+                          }
+                          const chosen = (paramChoices.get(gid) ?? new Map<string, number>()).get(entry.id) ?? 0
+                          const match = entry.matches[chosen] ?? entry.matches[0]
+                          if (match === undefined) return null
+                          return (
+                            <div key={entry.id} className="newapi-params-row">
+                              <span className="newapi-params-id">{entry.id}</span>
+                              <select
+                                className="newapi-select" aria-label={`${t('paramsProvider')} ${entry.id}`}
+                                value={String(chosen)}
+                                onChange={(event) => {
+                                  setParamChoices(current => {
+                                    const groupChoices = new Map(current.get(gid) ?? new Map<string, number>())
+                                    groupChoices.set(entry.id, Number(event.target.value))
+                                    return new Map(current).set(gid, groupChoices)
+                                  })
+                                }}
+                              >
+                                {entry.matches.map((candidate, at) => (
+                                  <option key={candidate.provider} value={String(at)}>
+                                    {`${candidate.official === true ? `${t('officialMark')} · ` : ''}${candidate.provider}: ${t('contextWindow')} ${candidate.contextWindow ?? '—'} / ${t('maxTokens')} ${candidate.maxTokens ?? '—'}${candidate.vision === true ? ` · ${t('vision')}` : ''}${candidate.reasoningEfforts !== undefined && candidate.reasoningEfforts.length > 0 ? ` · ${t('modelReasoning')}: ${candidate.reasoningEfforts.join('/')}` : ''}`}
+                                  </option>
+                                ))}
+                              </select>
+                              <span className="newapi-params-values">{match.provider}</span>
+                            </div>
+                          )
+                        })}
+                        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                          <button type="button" className="newapi-button newapi-button--primary" onClick={() => { applyParams(gid, true) }}>
+                            {t('paramsOverwrite')}
+                          </button>
+                          <button type="button" className="newapi-button" onClick={() => { applyParams(gid, false) }}>
+                            {t('paramsFillBlank')}
+                          </button>
+                          <button type="button" className="newapi-button" onClick={() => { setParams(current => new Map(current).set(gid, undefined as never)); setParamChoices(current => new Map(current).set(gid, new Map())) }}>
+                            {t('fetchCancel')}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+                : null}
+            </div>
+          )
+        })}
+      </div>
+
+      <button type="button" className="newapi-addgroup" disabled={busy || !writable} onClick={addGroup}>
+        <IconPlus /> {t('addGroup')}
+      </button>
 
       <p className="newapi-hint">{t('modelHint')}</p>
 

@@ -13,11 +13,15 @@
 /** The terminal payload the gateway (and OpenAI) sends after the last chunk. */
 export declare const DONE = "[DONE]";
 /**
- * Parse an SSE byte stream into data payloads. Yields `[DONE]` as the final
- * value and returns; throws `LlmError('STREAM_CLOSED')` when the stream ends
- * without it (truncated response — the model call cannot be trusted).
+ * Parse an SSE byte stream into data payloads. Chat completions yields the
+ * `[DONE]` sentinel as the final value and returns; Responses-API streams have
+ * no sentinel, so the caller passes `requireDone: false` and owns termination
+ * through its own terminal events. With the sentinel required, EOF before it
+ * throws `LlmError('STREAM_CLOSED')` (truncated response — the model call
+ * cannot be trusted).
  * @param stream - raw SSE bytes; reads may split anywhere, including mid-UTF-8 sequence.
  * @param onComment - optional transport-activity callback; comments never enter the yielded payload stream.
- * @returns each event's data payload in arrival order, the `[DONE]` sentinel last.
+ * @param requireDone - require the `[DONE]` sentinel before EOF (default true).
+ * @returns each event's data payload in arrival order, the `[DONE]` sentinel last when required.
  */
-export declare function parseSse(stream: ReadableStream<BufferSource>, onComment?: (comment: string) => void): AsyncGenerator<string>;
+export declare function parseSse(stream: ReadableStream<BufferSource>, onComment?: (comment: string) => void, requireDone?: boolean): AsyncGenerator<string>;

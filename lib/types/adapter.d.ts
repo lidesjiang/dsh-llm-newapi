@@ -228,7 +228,7 @@ export declare class NewApiAdapter extends LlmAdapter {
      * default, else the legacy `newapi` route.
      */
     private defaultProviderRoute;
-    discoverModels(request: LlmModelDiscoveryRequest): Promise<readonly LlmDiscoveredModel[]>;
+    discoverModels(request: LlmModelDiscoveryRequest, signal?: AbortSignal): Promise<readonly LlmDiscoveredModel[]>;
     /**
      * Download the models.dev catalog (optionally through the configured
      * forward proxy) and match every requested gateway id against it, serving

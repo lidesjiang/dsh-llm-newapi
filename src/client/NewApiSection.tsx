@@ -10,7 +10,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { DiscoveredModelView, IApiClient, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-client-connection/client'
+import type { ClientRemote, LlmDiscoveredModel, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import type { NewApiKey } from './locale.ts'
 import type { ModelsDevParamsRequest, ModelsDevParamsResponse } from './params-types.ts'
 
@@ -115,9 +115,9 @@ function IconPlus(): ReactNode {
   )
 }
 
-/** Inject face: the wire face, the bound translate, and the models.dev params call. */
+/** Inject face: the typed Remote projection, the bound translate, and the models.dev params call. */
 export interface NewApiSectionProps {
-  api: Pick<IApiClient, 'settings' | 'credentials' | 'llm'>
+  api: Pick<ClientRemote, 'settings' | 'credentials' | 'llm'>
   t: (key: NewApiKey) => string
   fetchModelParams: (
     request: ModelsDevParamsRequest,
@@ -197,7 +197,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | undefined>(undefined)
   // Fetch-model candidates + picked per group.
-  const [candidates, setCandidates] = useState<ReadonlyMap<string, readonly DiscoveredModelView[]>>(new Map())
+  const [candidates, setCandidates] = useState<ReadonlyMap<string, readonly LlmDiscoveredModel[]>>(new Map())
   const [picked, setPicked] = useState<ReadonlyMap<string, ReadonlySet<string>>>(new Map())
   // Per-group proxy drafts.
   const [proxies, setProxies] = useState<ReadonlyMap<string, { enabled: boolean; url: string }>>(new Map())
@@ -217,14 +217,14 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     setStatus('loading')
     setErrorText(undefined)
     try {
-      const described = await api.settings.describe({})
-      if (!described.result.ok) {
-        setErrorText(described.result.error.message)
+      const described = await api.settings.describe()
+      if (!described.ok) {
+        setErrorText(described.error.message)
         setStatus('error')
         return
       }
-      setWritable(described.result.value.writable)
-      const section = described.result.value.namespaces.find((entry: SettingsNamespaceView) => entry.ns === NS)
+      setWritable(described.value.writable)
+      const section = described.value.namespaces.find((entry: SettingsNamespaceView) => entry.ns === NS)
       if (section === undefined) {
         setErrorText(t('nsNotRegistered'))
         setStatus('error')
@@ -241,11 +241,11 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       setGroups(drafts)
       // Credential facts for every group ref.
       const refs = drafts.map(group => groupCredRef(textOf(group, 'id') || 'newapi'))
-      const credential = await api.credentials.describe({ refs })
-      if (credential.result.ok) {
+      const credential = await api.credentials.describe(refs)
+      if (credential.ok) {
         const byRef: Record<string, { configured: boolean; locked: boolean }> = {}
         for (const ref of refs) {
-          const view = credential.result.value.credentials[ref]
+          const view = credential.value[ref]
           byRef[ref] = {
             configured: view?.configured === true,
             locked: view?.writable === false,
@@ -355,19 +355,19 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       ops.push({ op: 'set', path: ['groups'], value: serializedGroups })
       ops.push({ op: 'unset', path: ['baseURL'] })
       ops.push({ op: 'unset', path: ['models'] })
-      const mutated = await api.settings.mutate({ ns: NS, ops, expectedRevision: revision })
-      if (!mutated.result.ok) {
-        setErrorText(mutated.result.error.message)
+      const mutated = await api.settings.mutate(NS, ops, revision)
+      if (!mutated.ok) {
+        setErrorText(mutated.error.message)
         return
       }
-      setRevision(mutated.result.value.revision)
+      setRevision(mutated.value.revision)
       // Write each non-empty key draft to its group's credential ref.
       for (const [ref, draft] of Object.entries(keyDrafts)) {
         const key = draft.trim()
         if (key.length === 0) continue
-        const stored = await api.credentials.set({ ref, value: key })
-        if (!stored.result.ok) {
-          setErrorText(stored.result.error.message)
+        const stored = await api.credentials.set(ref, key)
+        if (!stored.ok) {
+          setErrorText(stored.error.message)
           return
         }
       }
@@ -533,17 +533,15 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       const group = groups.find(g => textOf(g, 'id') === gid)
       const baseURL = textOf(group ?? {}, 'baseURL').trim()
       const key = (keyDrafts[groupCredRef(gid)] ?? '').trim()
-      const response = await api.llm.discoverModels({
-        settingsNs: NS,
-        provider: groupRoute(gid),
-        ...baseURL.length > 0 ? { baseURL } : {},
+      const response = await api.llm.discoverModels(NS, {
+        ...baseURL.length > 0 ? { provider: groupRoute(gid), baseURL } : { provider: groupRoute(gid) },
         ...key.length > 0 ? { apiKey: key } : {},
       })
-      if (!response.result.ok) {
-        setErrorText(response.result.error.message)
+      if (!response.ok) {
+        setErrorText(response.error.message)
         return
       }
-      const found = response.result.value.models
+      const found = response.value
       found.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
       if (found.length === 0) {
         setErrorText(t('fetchEmpty'))

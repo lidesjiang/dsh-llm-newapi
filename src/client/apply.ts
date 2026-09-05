@@ -4,9 +4,15 @@
  * own. Zero dsh modifications — the section slot is `kind: 'list'`, built for
  * feature-owned pages ("adding a setting never means editing the shell").
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context } from '@deepseek-ai/cordis'
 // Type-only: pulls the ctx.locale Context merge into this program.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Type-only: pulls the typed ctx.remote projection (Remote namespaces) into
+// this program; the web host mounts the Remote service.
+import type {} from '@deepseek-ai/dsh-api-remotes/client'
+// Type-only: pulls the ctx.slots Context merge (SlotRegistry, ui-renderer is
+// the slots service host in 0.1.2; the web host mounts it at boot).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
@@ -216,14 +222,14 @@ const SECTION_CSS = `
 .newapi-params-unmatched { color: var(--dsw-alias-label-dimmed); font-size: 12px; padding: 4px 0; }
 `
 
-/** Required services (cordis fiber inject): the section slot, copy, and the wire face. */
-export const inject = ['slots', 'locale', 'connection']
+/** Required services (cordis fiber inject): the section slot, copy, the wire face, and the typed Remote projection. */
+export const inject = ['slots', 'locale', 'connection', 'remote']
 
 /**
  * Register the NewAPI settings section.
  * @param ctx - client root context.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'llm-newapi: copy dictionaries')
 
   // Fiber-scoped styles: removed with the plugin, so a reload swaps them cleanly.
@@ -252,6 +258,16 @@ export function apply(ctx: ClientContext): void {
     id: 'newapi',
     order: 15,
     label: () => t('nav'),
-    inject: () => ({ api: connection.api, t, fetchModelParams }),
+    inject: () => ({
+      // The connection.api face was removed in 0.1.2 (DSH-0.1.2-A1-30); the
+      // section reads and writes through the typed Remote projection instead.
+      api: {
+        settings: ctx.remote.settings,
+        credentials: ctx.remote.credentials,
+        llm: ctx.remote.llm,
+      },
+      t,
+      fetchModelParams,
+    }),
   }, NewApiSection))
 }

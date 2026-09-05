@@ -527,7 +527,7 @@ export class NewApiAdapter extends LlmAdapter {
     return this.config.defaultProvider?.() ?? 'newapi'
   }
 
-  async discoverModels(request: LlmModelDiscoveryRequest): Promise<readonly LlmDiscoveredModel[]> {
+  async discoverModels(request: LlmModelDiscoveryRequest, signal?: AbortSignal): Promise<readonly LlmDiscoveredModel[]> {
     // The draft names the route it edits, if any; the connection snapshot for
     // that route supplies the fallback facts (exclude patterns, catalog).
     const connection = request.provider !== undefined
@@ -548,10 +548,10 @@ export class NewApiAdapter extends LlmAdapter {
           'accept': 'application/json',
           ...attributionHeaders(),
         },
-        ...request.signal === undefined ? {} : { signal: request.signal },
+        ...signal === undefined ? {} : { signal },
       })
     } catch (error: unknown) {
-      if (request.signal?.aborted) throw error
+      if (signal?.aborted) throw error
       throw new LlmError(`NewAPI model discovery request to ${base} failed`, 'TRANSPORT', { cause: error })
     }
     if (!response.ok) {

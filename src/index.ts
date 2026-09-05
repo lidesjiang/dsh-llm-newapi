@@ -24,8 +24,11 @@ import type { LlmConfigurableProvider, RetryPolicyConfig } from '@deepseek-ai/ds
 import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+// Type-only: pulls the cordis Context augmentation declaring ctx.settings
+// (SettingsProvider), which the removed installSettingsSection import used
+// to load transitively (0.1.2 migration).
+import type {} from '@deepseek-ai/dsh-settings'
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MODEL_EXCLUDE_PATTERNS,
@@ -57,7 +60,7 @@ export type * from './types.ts'
 export const name = 'llm-newapi'
 export const inject = ['llm']
 
-const NS = settingsNamespace('llm-newapi')
+const NS = 'llm-newapi'
 
 /** Environment variable naming a gateway endpoint, honored only from trusted layers. */
 const BASE_URL_ENV = 'NEWAPI_BASE_URL'
@@ -503,7 +506,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // Model discovery: interrogate the gateway's /models with the draft endpoint.
-  ctx.llm.registerModelDiscovery(NS, request => adapter.discoverModels(request))
+  ctx.llm.registerModelDiscovery(NS, (request, signal) => adapter.discoverModels(request, signal))
 
   // RPC channel for models-dev-params.
   ctx.inject(['connection'], (cctx) => {
@@ -529,21 +532,27 @@ export function apply(ctx: Context, config: Config): void {
             },
           }))
       },
-      { authority: 'loopback' },
     ), 'llm-newapi: models-dev RPC channel')
   })
 
   // Initial sync + settings section.
   syncProviders()
 
-  installSettingsSection(ctx, NS, Config, config, {
-    validate: (value) => {
-      const groups = expandGroups(value, launchEnvironmentOf(ctx))
-      for (const g of groups) resolveGroupOptions(g, launchEnvironmentOf(ctx))
-    },
-    setSource: (source) => {
-      current = source
-    },
-    onChange: syncProviders,
+  // The settings section installs once the settings service mounts: the
+  // section lives on the user-settings seam (SettingsProvider.installSection,
+  // 0.1.2) instead of the removed installSettingsSection helper. The owner
+  // context is this plugin's own ctx — separate lifecycle from the settings
+  // service context.
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, NS, Config, config, {
+      validate: (value) => {
+        const groups = expandGroups(value, launchEnvironmentOf(ctx))
+        for (const g of groups) resolveGroupOptions(g, launchEnvironmentOf(ctx))
+      },
+      setSource: (source) => {
+        current = source
+      },
+      onChange: syncProviders,
+    })
   })
 }

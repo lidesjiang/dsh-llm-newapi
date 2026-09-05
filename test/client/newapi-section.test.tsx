@@ -25,7 +25,7 @@ function storedGroups(models: unknown[] = [{ id: 'deepseek-chat', contextWindow:
   }
 }
 
-/** A wire face answering one resolved llm-newapi section. */
+/** A wire face answering one resolved llm-newapi section (RemoteResult shapes). */
 function wireFace(overrides: Partial<{
   describeAnswer: unknown
   credentialsAnswer: unknown
@@ -33,29 +33,28 @@ function wireFace(overrides: Partial<{
   return {
     settings: {
       describe: vi.fn(() => Promise.resolve({
-        result: {
-          ok: true,
-          value: overrides.describeAnswer ?? {
-            writable: true,
-            hasDocument: true,
-            namespaces: [{
-              ns: 'llm-newapi',
-              schema: {},
-              value: storedGroups(),
-              applies: 'live',
-              secrets: [],
-              revision: 7,
-            }],
-          },
+        ok: true,
+        value: overrides.describeAnswer ?? {
+          writable: true,
+          hasDocument: true,
+          namespaces: [{
+            ns: 'llm-newapi',
+            schema: {},
+            value: storedGroups(),
+            applies: 'live',
+            secrets: [],
+            revision: 7,
+          }],
         },
       })),
-      mutate: vi.fn(() => Promise.resolve({ result: { ok: true, value: { ns: 'llm-newapi', revision: 8 } } })),
+      mutate: vi.fn(() => Promise.resolve({ ok: true, value: { ns: 'llm-newapi', revision: 8 } })),
     },
     credentials: {
       describe: vi.fn(() => Promise.resolve({
-        result: { ok: true, value: overrides.credentialsAnswer ?? { credentials: { newapi: { configured: true, writable: true } } } },
+        ok: true,
+        value: overrides.credentialsAnswer ?? { newapi: { configured: true, writable: true } },
       })),
-      set: vi.fn(() => Promise.resolve({ result: { ok: true, value: undefined } })),
+      set: vi.fn(() => Promise.resolve({ ok: true, value: undefined })),
     },
     llm: { discoverModels: vi.fn() },
   }
@@ -103,7 +102,7 @@ describe('NewApiSection mount', () => {
 
 describe('environment-supplied credential (read-only)', () => {
   const envCredential = {
-    credentials: { newapi: { configured: true, writable: false, source: 'env' } },
+    newapi: { configured: true, writable: false, source: 'env' },
   }
 
   it('locks the key field with the launch-environment placeholder', async () => {
@@ -172,7 +171,7 @@ describe('models.dev params update', () => {
     await waitFor(() => { expect(screen.getByText(new RegExp(t('paramsApplied')))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     const models = groups[0].models
     expect(models[0]).toEqual({ id: 'deepseek-chat', contextWindow: 128_000, maxTokens: 8_192, reasoningEfforts: ['low', 'medium', 'high'] })
@@ -193,7 +192,7 @@ describe('models.dev params update', () => {
     await waitFor(() => { expect(screen.getByText(new RegExp(t('paramsApplied')))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     const models = groups[0].models
     expect(models[0]).toEqual({ id: 'deepseek-chat', contextWindow: 65_536, maxTokens: 8_192, reasoningEfforts: ['low', 'medium', 'high'] })
@@ -219,7 +218,7 @@ describe('models.dev params update', () => {
     fireEvent.click(screen.getByText(t('fetchCancel')))
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].proxy).toEqual({ enabled: true, url: 'http://127.0.0.1:7897' })
   })
@@ -228,7 +227,7 @@ describe('models.dev params update', () => {
 describe('model catalog', () => {
   /** The models op of the first mutate call. */
   function savedModels(api: ReturnType<typeof wireFace>): Array<Record<string, unknown>> {
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     return groups[0].models
   }
@@ -236,10 +235,8 @@ describe('model catalog', () => {
   it('sorts fetched candidates by id and the adopted rows keep that order', async () => {
     const api = wireFace()
     api.llm.discoverModels.mockResolvedValueOnce({
-      result: {
-        ok: true,
-        value: { models: [{ id: 'zhipu/glm-5.3' }, { id: 'aa-first' }, { id: 'deepseek-chat' }] },
-      },
+      ok: true,
+      value: [{ id: 'zhipu/glm-5.3' }, { id: 'aa-first' }, { id: 'deepseek-chat' }],
     })
     render(<NewApiSection api={api as never} t={t} fetchModelParams={paramsFace() as never} />)
     await expandFirstGroup()
@@ -301,7 +298,7 @@ describe('model catalog', () => {
 
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].models).toEqual([])
   })
@@ -332,7 +329,7 @@ describe('model catalog', () => {
     fireEvent.change(screen.getByLabelText(`${t('baseUrl')} 2`), { target: { value: 'http://ginka.local:8080/v1' } })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups.length).toBe(2)
     expect(groups[1].id).toBe('ginka')
@@ -353,7 +350,7 @@ describe('API type selection', () => {
     await waitFor(() => { expect(screen.getByText(t('apiTypeResponsesHint'))).toBeTruthy() })
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].apiType).toBe('responses')
   })
@@ -383,7 +380,7 @@ describe('API type selection', () => {
 
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].apiType).toBe('responses')
   })
@@ -397,7 +394,7 @@ describe('API type selection', () => {
     expect(picker.value).toBe('chat')
     fireEvent.click(screen.getByText(t('apply')))
     await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
-    const groups = api.settings.mutate.mock.calls[0][0].ops
+    const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].apiType).toBeUndefined()
   })

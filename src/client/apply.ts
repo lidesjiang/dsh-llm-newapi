@@ -222,8 +222,23 @@ const SECTION_CSS = `
 .newapi-params-unmatched { color: var(--dsw-alias-label-dimmed); font-size: 12px; padding: 4px 0; }
 `
 
-/** Required services (cordis fiber inject): the section slot, copy, the wire face, and the typed Remote projection. */
-export const inject = ['slots', 'locale', 'connection', 'remote']
+/**
+ * Required services (cordis fiber inject): the section slot, copy, the wire face,
+ * and the typed Remote projection. The `remote.<ns>` dotted names are cordis
+ * services of their own — every caller that reads `ctx.remote.settings` /
+ * `.credentials` / `.llm` must declare the matching dotted name in its own
+ * inject (see dsh-client-ui-settings-general inject and dsh-client-ui-settings
+ * client.js:1133 "every caller declare `remote.settings` in its own `inject`").
+ */
+export const inject = [
+  'slots',
+  'locale',
+  'connection',
+  'remote',
+  'remote.settings',
+  'remote.credentials',
+  'remote.llm',
+]
 
 /**
  * Register the NewAPI settings section.

@@ -130,7 +130,13 @@ jobs:
         with:
           node-version: 24
       - name: Install dsh and pnpm
-        run: npm install -g @deepseek-ai/dsh pnpm
+        run: |
+          # Pin dsh to the peer line this plugin targets (its bundled
+          # @deepseek-ai/* dependencies — including the delegated
+          # dsh-llm-deepseek adapter — are fixed to the same line). A moving
+          # `latest` install would test an unsupported cross-line mix instead
+          # of the shipped configuration.
+          npm install -g @deepseek-ai/dsh@0.1.2-rc.1 pnpm
       - name: Install the packed tarball into a fresh web profile
         run: |
           set -euo pipefail
@@ -164,9 +170,16 @@ jobs:
           set -euo pipefail
           export DSH_HOME="$RUNNER_TEMP/dsh-home"
           LOG="$RUNNER_TEMP/dsh-web.log"
+          COOKIES="$RUNNER_TEMP/dsh-cookies.txt"
           dsh web > "$LOG" 2>&1 &
           WEB_PID=$!
           trap 'kill "$WEB_PID" 2>/dev/null || true' EXIT
+          # dsh 0.1.2 prints a per-boot auth token URL; exchange it for a
+          # session cookie. (The pre-0.1.2 line served unauthenticated —
+          # the empty-token arm keeps that model working too.)
+          TOKEN="$(sed -n 's/.*[?&]token=\([A-Za-z0-9_-][A-Za-z0-9_.-]*\).*/\1/p' "$LOG" | head -n1)"
+          AUTH=()
+          if [ -n "$TOKEN" ]; then AUTH=(-b "$COOKIES"); fi
           code=""
           for _ in $(seq 1 120); do
             if ! kill -0 "$WEB_PID" 2>/dev/null; then
@@ -174,7 +187,11 @@ jobs:
               cat "$LOG"
               exit 1
             fi
-            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
+            if [ -n "$TOKEN" ]; then
+              code="$(curl -s -c "$COOKIES" -L -o /dev/null -w '%{http_code}' "http://127.0.0.1:3080/?token=$TOKEN" || true)"
+            else
+              code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
+            fi
             [ "$code" = "200" ] && break
             sleep 1
           done
@@ -184,8 +201,23 @@ jobs:
             exit 1
           fi
           echo "web ready on :3080"
-          # The plugin's browser half is served for the module loader.
-          client="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:3080/plugins/dsh-llm-newapi/client.js")"
+          # The plugin's browser half is served for the module loader. The
+          # pre-0.1.2 line served the bare per-plugin path; 0.1.2+ serves
+          # only the composed combo URLs advertised in the boot page — try
+          # the bare path, then fall back to the combo URL the index HTML
+          # lists for this plugin.
+          client="$(curl -s "${AUTH[@]}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:3080/plugins/dsh-llm-newapi/client.js")"
+          if [ "$client" != "200" ]; then
+            bundle_url="$(curl -s "${AUTH[@]}" http://127.0.0.1:3080/ \
+              | grep -oE '/plugins/[^"'"'"' <]*dsh-llm-newapi/client\.js(&amp;|&)rev=[A-Za-z0-9-]+' \
+              | head -n1 | sed 's/&amp;/\&/')" || true
+            if [ -z "$bundle_url" ]; then
+              echo "::error::neither the bare client path nor a combo URL for dsh-llm-newapi was advertised"
+              cat "$LOG"
+              exit 1
+            fi
+            client="$(curl -s "${AUTH[@]}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:3080$bundle_url")"
+          fi
           if [ "$client" != "200" ]; then
             echo "::error::client bundle not served (HTTP $client)"
             cat "$LOG"
@@ -193,7 +225,7 @@ jobs:
           fi
           # The plugin's RPC channel exists: any answer but 405 proves the
           # route registered (405 is the SPA fallback rejecting a POST).
-          rpc="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+          rpc="$(curl -s "${AUTH[@]}" -o /dev/null -w '%{http_code}' -X POST \
             http://127.0.0.1:3080/llm-newapi/models-dev-params \
             -H 'content-type: application/json' \
             -d '{"type":"client-request","rpcId":"ci-boot","method":"models-dev-params","payload":{"modelIds":[]}}')"

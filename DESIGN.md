@@ -171,3 +171,50 @@ dsh-llm-newapi/
 - **上游自适应推理控制**：若上游全是 DeepSeek 系，可在 v0.1 后加可选 `compat: 'deepseek'` 开关恢复 `thinking`/`reasoning_effort` 字段；默认关闭。
 - **发现过滤的能力元数据**：若 NewAPI 未来在 listing 暴露类型字段（或走管理 API），`modelExcludePatterns` 命名约定可升级为能力判断。
 - **构建验证**：本脚手架未经 `npm install` + `tsc` 实编（沙箱 npm 缓存只读）；代码与官方 `llm-deepseek` 逐段同源，差异点已在 §3 列尽，安装依赖后应一次通过。
+
+## 10. official-direct 连接模式（v0.11.0）
+
+需求：一组可从 NewAPI 网关切换到 DeepSeek 官方 API 直连——完整推理块流式、`reasoning_effort`、工具调用，绕过网关对官方 wire 格式的损耗。约束：不覆盖官方路由（`DUPLICATE_ADAPTER`）、`newapi` 模式零行为影响、key 只入 `.credentials.yaml` 且只存引用、固定官方包版本。
+
+### 委托而非继承：结构化 delegate 接口
+
+`NewApiAdapter` 不 import 官方 `DeepSeekAdapter` 类型（`src/adapter.ts` 自身零官方包依赖），而是声明结构化接口 `OfficialAdapterDelegate { stream; listModels; resolveModel }`；`NewApiAdapterOptions` 增 `createOfficialAdapter?: (connection) => OfficialAdapterDelegate` 工厂。`src/index.ts` 的 `createOfficialAdapter` 负责真实接线：`resolveOfficialOptions({ baseURL, apiKeyEnv, streamIdleTimeoutMs })` + `new DeepSeekAdapter({ options, resolveApiKey, resolveUserId, resolveAttachments, resolveImageAccess, prepareExtensions })`，照官方 apply 的接线（dsh-llm-deepseek lib/index.js:2010-2036）。理由：
+
+1. **adapter 层可测**——工厂注入 stub delegate 即可单测模式分支，不需要真实官方包。
+2. **类型解耦**——`adapter.ts` 只依赖 `dsh-llm` seam 类型，官方包只在 `index.ts` 出现（bundle 体积与类型面都收窄）。
+3. **无工厂即拒绝**——official-direct 且无工厂时抛 `LlmError INVALID_REQUEST`，不会静默走网关路径。
+
+delegate 按**连接快照 identity** 缓存（`officialAdapterFor(connection)`）：`resolveGroups()` 对未变更的 raw config 返回同一对象（identity 比较），所以一代配置恰一个 delegate 实例、共享官方 Files-API 上传索引（同附件不重复上传）；配置变更 → 新快照 → 新实例，旧 inflight 请求持旧引用自然排空。
+
+### 凭证引用隔离：三个命名空间互不覆盖
+
+| 引用 | 用途 |
+|---|---|
+| `newapi` / `newapi_<safe_id>` | 网关 key（既有） |
+| `deepseek_official` / `deepseek_official_<safe_id>` | 本插件 official-direct 组的官方 key（`groupOfficialCredRef(id)` 派生） |
+| `DEEPSEEK_API_KEY` | 官方 dsh-llm-deepseek 路由自有引用 |
+
+`deepseek_official` 前缀与网关 ref（`newapi`/`newapi_<id>`）和官方路由的 `DEEPSEEK_API_KEY` 均无交集——组在两种模式间来回切换永不覆盖对方 key。用户可用 `officialApiKeyRef` 自定义（校验 `isCredentialRefName`：`/^[A-Za-z_][A-Za-z0-9_]*$/`，与 credentials seam 同规——连字符会炸 seam，settings 校验直接拒绝）。key 只经 `credentials.set(ref, key)` 写 `.credentials.yaml`，配置面只存引用名。
+
+### 版本固定 0.1.2-rc.1（非 0.1.5-rc.2）
+
+本仓 peer 栈全为 `^0.1.2-rc.1`，官方包同线发布 `0.1.2-rc.1`（peerDeps 完全对齐）。选 `0.1.2-rc.2`+ 或 `0.1.5-rc.2` 都会要求 0.1.5 线 peer，在 `autoInstallPeers: false` 的 profile 里装出平行副本（双 cordis 服务 = 插件静默失效，见 README 安装警告）。因此 `dependencies` 精确固定 `@deepseek-ai/dsh-llm-deepseek@0.1.2-rc.1` 与 `@deepseek-ai/dsh-anonymous-user-id@0.1.2-rc.1`（无 `^`）。升线时随 peer 栈一起动。
+
+### 配置语义：网关字段惰性化
+
+`resolveGroupOptions`（唯一校验点，load/首用快照/settings validate 三处共用）在 official-direct 下把网关 `baseURL` 视为惰性（回退占位符，不校验）——UI 允许先建组后填地址，official 组保存不应被半填的网关地址阻塞。`officialBaseURL` 缺省回退 `DEFAULT_OFFICIAL_BASE_URL = 'https://api.deepseek.com'`（官方端点**不带** `/v1`，与网关约定相反，`normalizeBaseUrl` 传第二参数定制报错文案）。`newapi` 模式分支零改动（回归由 smoke Block K 保证）。
+
+### 官方包适配的三个坑（实证记录）
+
+1. `resolveAdapterOptions(config)` 只吃 **raw** `RetryPolicyConfig`——传已 resolved 的 `ResolvedRetryPolicy` 报 `unknown key "initialDelayMs"`；故不传 `retryPolicy`，官方默认策略生效。
+2. `ctx.llm` 公开 API 无 `resolveModel`，测试用 `resolveModelInfo(provider, model)`（`dsh-llm/lib/types/index.d.ts:343`）。
+3. `ctx.llm.stream` 把适配器抛错包成 `error finish chunk` 而非 throw——断言须 for-await 收集后看末 chunk 的 `reason.failure`。
+
+### CI boot 门禁适配 dsh 0.1.2 服务模型
+
+旧门禁的两处断言基于 dsh 0.1.1 行为，对 0.1.2+ 全线失效（本地实证 + 对比 0.1.1-rc.2 / 0.1.2-alpha.5 / 0.1.5-rc.2 的 `dsh-client-modules` 源码）：
+
+1. **认证**：0.1.2 起 `dsh web` 打印 `?token=` URL，裸 curl `/` 得 401（0.1.1 无 fence）。新门禁从日志提取 token，`curl -c cookie -L` 换会话 cookie。
+2. **静态服务模型**：0.1.1 的 `serveBundle` 按裸路径 `/plugins/<id>/client.js` 磁盘读文件；0.1.2-alpha.5 起 `serveBundle` 只服务预组合资源表（combo URL `/plugins/??<id>/client.js&rev=<hash>`，`__DSH_BOOT__` JSON 中每 entry 带 `url`），裸路径一律 404。新门禁先试裸路径（保持 0.1.1 兼容），失败则从 index HTML 提取该插件的 combo URL 再断言 200。grep 模式注意 `&` 在 HTML 中转义为 `&amp;`：`client\.js(&amp;|&)rev=`（可选组匹配空会漏掉裸 `&`）。
+
+boot job 的 dsh 安装同时钉到 `@deepseek-ai/dsh@0.1.2-rc.1`（与 peer 线一致）——旧写法装 latest（现为 0.1.5-rc.1）会把门禁变成不受支持的跨线混测。新逻辑已在本地 Windows（git-bash + curl）对真实 0.1.2-rc.1 实例彩排通过：token→cookie→root 200、combo URL→client bundle 200、RPC `/llm-newapi/models-dev-params` 200 非 405。

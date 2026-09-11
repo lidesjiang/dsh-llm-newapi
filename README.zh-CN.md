@@ -4,10 +4,11 @@
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）增加 LLM 供应商 **NewAPI** 的插件。**零 dsh 修改**。
 
-- 供应商 route id：`newapi`
+- 供应商 route id：`newapi`（legacy 组）/ `newapi-<id>`（每组一路）
 - 显示名称：`NewAPI`
 - 形态：LLM Provider 插件——实现 `@deepseek-ai/dsh-llm` 的 `LlmAdapter` seam；NewAPI 为 OpenAI 兼容网关（`POST {baseURL}/chat/completions`、`GET {baseURL}/models`，baseURL 含 `/v1`）
 - 双侧结构：宿主侧（adapter + 模型发现）+ 浏览器侧（dsh web 设置面板中的「NewAPI」设置页，含「获取模型」）
+- 每组连接模式（v0.11.0）：`newapi`（默认，经网关中转）或 `official-direct`——委托官方 `@deepseek-ai/dsh-llm-deepseek` 适配器，用你自己的 Base URL + Key 直连 DeepSeek 官方 API，绕过网关格式损耗（推理块、`reasoning_effort`、工具调用完整支持）
 
 设计决策与差异分析见 [DESIGN.md](DESIGN.md)；参考实现 `deepseek-harness/packages/llm/llm-deepseek`。
 
@@ -63,7 +64,7 @@ dsh plugin --profile web add link:$(pwd)
 
 > **安装时的 missing peer 警告是预期行为，可忽略**：`react`/`cordis`/`dsh-llm`/`dsh-settings`/`schemastery` 等运行时由 dsh 宿主 app 提供，插件声明为 `peerDependencies` 正是要求"不要装自己的副本"；profile 的 `autoInstallPeers: false` 让 pnpm 静态报 missing。所有 dsh 插件安装时都会出现这行 WARN（dsh-at-file 等同款），安装成功不受影响。切勿手动安装该列表或开启 autoInstallPeers——会导致 cordis 服务双实例、插件静默失效。
 
-装好后：设置面板出现「NewAPI」页 → 填 API key 与网关地址（含 `/v1`）→「获取模型」拉取并勾选 chat 模型（embedding / rerank / ranker 自动过滤）→ 保存。模型选择器（composer）即出现 `newapi` 路由的模型。
+装好后：设置面板出现「NewAPI」页 → 填 API key 与网关地址（含 `/v1`）→「获取模型」拉取并勾选 chat 模型（embedding / rerank / ranker 自动过滤）→ 保存。模型选择器（composer）即出现 `newapi` 路由的模型。每组卡片带**连接模式**选择器：`newapi`（网关中转，默认）或 `official-direct`（DeepSeek 官方直连）；切换按组持久化，两种模式各存各的 API key。
 
 ## 配置（cordis.yml entry config；装机后 settings.yaml `llm-newapi:` 段热更新覆盖）
 
@@ -72,6 +73,14 @@ dsh plugin --profile web add link:$(pwd)
   name: dsh-llm-newapi
   config:
     baseURL: http://gw.local:3000/v1   # 含 /v1 前缀；缺省回退 env NEWAPI_BASE_URL → 占位符
+    # mode: official-direct            # 连接模式：'newapi'（默认，经网关中转）
+    #                                  或 'official-direct'（委托官方 DeepSeek 适配器；
+    #                                  baseURL/apiType/proxy 与模型目录随之惰性化）
+    # officialBaseURL: https://api.deepseek.com   # 仅 official-direct；不带 /v1；缺省即
+    #                                              # https://api.deepseek.com
+    # officialApiKeyRef: my_official_key          # 仅 official-direct；官方 key 的凭证引用，
+    #                                              # 缺省派生为 deepseek_official_<id>
+    #                                  # （须匹配 /^[A-Za-z_][A-Za-z0-9_]*$/，禁连字符）
     # apiType: chat                    # 接口协议：'chat'（默认，走 POST {baseURL}/chat/completions）
     #                                  或 'responses'（OpenAI Responses API，走 POST {baseURL}/responses，
     #                                  适合 Agent / 多步输出 / 工具调用）
@@ -88,9 +97,17 @@ dsh plugin --profile web add link:$(pwd)
     #     glm: zhipuai                 #   例：改用智谱开放平台的数据
     #   models:                        #   逐 id 精确 → provider（优先于家族）
     #     tencent/Hunyuan-MT-7B: nano-gpt
+    # groups:                          # 多网关：每组一个独立的 newapi-<id> provider 路由
+    #   - id: work                     #   （上面的 legacy 扁平字段即隐式 'newapi' 组）
+    #     baseURL: http://gw-work:3000/v1
+    #   - id: ds-official
+    #     mode: official-direct        #   official-direct 组：请求直发 officialBaseURL
+    #     officialBaseURL: https://api.deepseek.com
 ```
 
-**API 密钥**：不是配置项——固定存于 credentials store 的 `newapi` 引用下，唯一配置面是 web 设置页（写后立即生效，每请求解析）。插件不从任何环境变量读 key：credentials 服务的顶层只读层就是继承环境，`NEWAPI_API_KEY` 式引用会被环境里同名变量遮蔽并锁死前端输入框，故引用名固定为 `newapi`。无密钥时首个请求以 `MISSING_CREDENTIAL` 失败并指向设置页，不在装载时报错。
+**连接模式（v0.11.0）**：`mode: official-direct` 把一组从 NewAPI 网关切到 DeepSeek 官方 API。插件把整条请求链路委托给官方 `@deepseek-ai/dsh-llm-deepseek` 适配器（精确固定 `0.1.2-rc.1` 依赖，与本仓 peer 栈同线，不会装平行副本），复用其序列化（`thinking` + `reasoning_effort`、官方遥测头）、推理块流式（`reasoning_content` → harness reasoning chunk）、工具调用、vision/Files-API 附件链路，模型发现离线返回官方内置目录（deepseek-v4-flash / v4-pro / v4-flash-vision-exp，1M 上下文，每模型声明 off/low/high/max 等级）而不探测网关。官方 API key 存独立的凭证引用（缺省 `deepseek_official_<id>`，或你配置的 `officialApiKeyRef`）——组在两种模式间切换互不覆盖对方的 key。official-direct 下网关字段（baseURL、apiType、proxy）与 models.dev 参数面板惰性化：网关地址留空或半填不再阻塞保存。
+
+**API 密钥**：不是配置项——固定存于 credentials store 的 `newapi` 引用下，唯一配置面是 web 设置页（写后立即生效，每请求解析）。插件不从任何环境变量读 key：credentials 服务的顶层只读层就是继承环境，`NEWAPI_API_KEY` 式引用会被环境里同名变量遮蔽并锁死前端输入框，故引用名固定为 `newapi`。无密钥时首个请求以 `MISSING_CREDENTIAL` 失败并指向设置页，不在装载时报错。official-direct 组的 key 存独立引用（`deepseek_official` / `deepseek_official_<id>`，或配置的 `officialApiKeyRef`）——两种模式互不共享、互不覆盖，官方 key 缺失时同样以 `MISSING_CREDENTIAL` 失败并在报错中点名引用名。
 
 **模型发现**：`GET {baseURL}/models`，只采纳可服务 chat-completions 的模型——embedding / rerank / ranker 家族按命名约定过滤（可配）。
 
@@ -117,6 +134,10 @@ npm run cache:models-dev      # 本地缓存 models.dev/api.json 到 .cache/（g
 改源码后须重跑 `npm run build` 并**提交 `lib/`**——`github:` 安装从提交的产物运行，CI 的「Committed artifacts are current」步骤会在产物过期时拒绝。
 
 ## 状态
+
+v0.11.0：official-direct 连接模式——每组（或 legacy 扁平配置）可选 `mode: official-direct`，绕过 NewAPI 网关直连 DeepSeek 官方 API。适配器把整条请求链路委托给官方 `@deepseek-ai/dsh-llm-deepseek` 适配器（作为精确固定的 `0.1.2-rc.1` 依赖打包，与本仓 peer 栈同线，不产生平行副本），复用其序列化（`thinking` + `reasoning_effort`、官方遥测头）、推理块流式、工具调用、vision/Files-API 附件链路与内置模型目录（离线供给，1M 上下文，每模型 off/low/high/max 等级）。官方 key 存每组的 `deepseek_official_<id>` 凭证引用（或配置的 `officialApiKeyRef`），与网关 key、官方插件自有的 `DEEPSEEK_API_KEY` 引用完全隔离。设置页：每组连接模式选择器；official-direct 组显示官方 base URL（默认 `https://api.deepseek.com`，不带 `/v1`）与官方 key 输入框，隐藏网关专属控件，卡片带「官方」徽标；切回 `newapi` 时网关字段原样恢复。顺带修复一个预存在崩溃：组 `baseURL` 留空时（UI 允许先保存组再填地址）`.trim()` 抛错，现回退占位符。CI boot 门禁适配 dsh 0.1.2 服务模型（token cookie + 组合 URL 断言；dsh 钉到同线版本）。
+
+v0.10.0：迁移到 dsh 0.1.2-rc.1 线——所有 `@deepseek-ai/*` peer 升至 `^0.1.2-rc.1`（cordis 4、schemastery 3.18）；浏览器侧移除已废弃的 `dsh-client-runtime` 包（ClientContext → cordis Context）、`ctx.connection.api` 面改走 `ctx.remote` 投影；`settings.mutate`/`discoverModels` RPC 签名随新协议调整。wire 行为无变化。
 
 v0.9.0：每网关组可选接口协议——`chat`（默认，走 `POST {baseURL}/chat/completions`）或 `responses`（OpenAI Responses API，走 `POST {baseURL}/responses`，适合 Agent / 多步输出 / 工具调用）。responses 组按 Responses-API 形态序列化（`instructions`、role 消息 + `function_call` / `function_call_output` 输入项、`max_output_tokens`、`reasoning.effort`、工具 `name` 置顶），并把 Responses-API SSE 事件（`output_text.delta`、`output_item.added`、`function_call_arguments.delta`，以 `completed` / `incomplete` / `failed` 收尾）翻译成同一套 harness 流契约——`/responses` 流无需 `[DONE]` 哨兵。设置页：每组新增接口类型选择器，responses 组卡片头部带协议徽标。
 

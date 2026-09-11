@@ -181,6 +181,8 @@ const SECTION_CSS = `
 .newapi-addmodel:disabled, .newapi-addgroup:disabled { opacity: 0.4; cursor: default; }
 .newapi-candidates { border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
 .newapi-candidates ul { list-style: none; padding: 0; margin: 8px 0; }
+.newapi-candidates-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.newapi-candidates-search { width: 100%; margin: 8px 0; }
 /* Proxy control + models.dev params panel. */
 .newapi-proxyrow {
   display: flex; flex-direction: row; align-items: center; flex-wrap: wrap;

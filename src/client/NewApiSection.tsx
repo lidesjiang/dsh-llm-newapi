@@ -82,6 +82,15 @@ function highestOf(efforts: readonly unknown[]): string {
   return [...ids].sort((a, b) => (EFFORT_RUNG[b] ?? -1) - (EFFORT_RUNG[a] ?? -1))[0] ?? ''
 }
 
+/** Whether a discovered model matches the candidate filter text: empty matches
+ *  everything, otherwise a case-insensitive substring of the id or display name. */
+function matchesFilter(model: LlmDiscoveredModel, filter: string): boolean {
+  const needle = filter.trim().toLowerCase()
+  if (needle.length === 0) return true
+  if (model.id.toLowerCase().includes(needle)) return true
+  return model.name !== undefined && model.name.toLowerCase().includes(needle)
+}
+
 /** Disclosure chevron; rotates to point down while its row is open. */
 function IconChevron({ open }: { open: boolean }): ReactNode {
   return (
@@ -143,9 +152,25 @@ function groupCredRef(id: string): string {
   return id === 'newapi' ? 'newapi' : `newapi_${safe}`
 }
 
+/**
+ * Derived credential ref for a group's official-direct API key (mirrors the
+ * host's groupOfficialCredRef): the `deepseek_official` prefix never collides
+ * with a gateway ref nor the official plugin's DEEPSEEK_API_KEY reference, so
+ * each group keeps one key per mode.
+ */
+function groupOfficialCredRef(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_]/g, '_')
+  return id === 'newapi' ? 'deepseek_official' : `deepseek_official_${safe}`
+}
+
 /** Wire protocol of a group: `chat` (default) or `responses`. */
 function apiTypeOf(group: GroupDraft): 'chat' | 'responses' {
   return textOf(group, 'apiType') === 'responses' ? 'responses' : 'chat'
+}
+
+/** Connection mode of a group: `newapi` (default) or `official-direct`. */
+function modeOf(group: GroupDraft): 'newapi' | 'official-direct' {
+  return textOf(group, 'mode') === 'official-direct' ? 'official-direct' : 'newapi'
 }
 
 /** Convert a stored section value into editable group drafts without dropping fields. */
@@ -199,6 +224,8 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   // Fetch-model candidates + picked per group.
   const [candidates, setCandidates] = useState<ReadonlyMap<string, readonly LlmDiscoveredModel[]>>(new Map())
   const [picked, setPicked] = useState<ReadonlyMap<string, ReadonlySet<string>>>(new Map())
+  // Per-group candidate filter text (live search input).
+  const [filters, setFilters] = useState<ReadonlyMap<string, string>>(new Map())
   // Per-group proxy drafts.
   const [proxies, setProxies] = useState<ReadonlyMap<string, { enabled: boolean; url: string }>>(new Map())
   // Per-group models.dev params panel.
@@ -239,8 +266,14 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         : [{ id: 'newapi', ...(typeof value.baseURL === 'string' ? { baseURL: value.baseURL } : {}), ...(Array.isArray(value.models) ? { models: value.models } : {}) }]
       const drafts = toGroupDrafts(storedGroups)
       setGroups(drafts)
-      // Credential facts for every group ref.
-      const refs = drafts.map(group => groupCredRef(textOf(group, 'id') || 'newapi'))
+      // Credential facts for every group ref — the gateway ref of every group
+      // plus the official ref of each official-direct group.
+      const refs = [...new Set(drafts.flatMap(group => {
+        const gid = textOf(group, 'id') || 'newapi'
+        return modeOf(group) === 'official-direct'
+          ? [groupCredRef(gid), groupOfficialCredRef(gid)]
+          : [groupCredRef(gid)]
+      }))]
       const credential = await api.credentials.describe(refs)
       if (credential.ok) {
         const byRef: Record<string, { configured: boolean; locked: boolean }> = {}
@@ -314,8 +347,10 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         const id = textOf(group, 'id').trim()
         const name = textOf(group, 'name').trim()
         const baseURL = textOf(group, 'baseURL').trim()
+        const mode = modeOf(group)
+        const officialBaseURL = textOf(group, 'officialBaseURL').trim()
         const proxy = proxies.get(id)
-        const models = modelsOf(group).map(model => {
+        const models = mode === 'official-direct' ? [] : modelsOf(group).map(model => {
           const mid = textOf(model, 'id').trim()
           const mname = textOf(model, 'name').trim()
           const contextWindow = numberOf(model, 'contextWindow')
@@ -340,10 +375,12 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         return {
           id,
           ...name.length > 0 ? { name } : {},
-          ...baseURL.length > 0 ? { baseURL } : {},
-          ...apiTypeOf(group) === 'responses' ? { apiType: 'responses' as const } : {},
+          ...mode === 'official-direct' ? { mode: 'official-direct' as const } : {},
+          ...mode === 'official-direct' && officialBaseURL.length > 0 ? { officialBaseURL } : {},
+          ...baseURL.length > 0 && mode === 'newapi' ? { baseURL } : {},
+          ...apiTypeOf(group) === 'responses' && mode === 'newapi' ? { apiType: 'responses' as const } : {},
           models,
-          ...proxy !== undefined ? {
+          ...mode === 'newapi' && proxy !== undefined ? {
             proxy: {
               enabled: proxy.enabled,
               url: proxy.url.trim().length > 0 ? proxy.url.trim() : DEFAULT_PROXY_URL,
@@ -430,6 +467,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     setEditing(current => remapMap(current))
     setCandidates(current => remapMap(current))
     setPicked(current => remapMap(current))
+    setFilters(current => remapMap(current))
     setProxies(current => remapMap(current))
     setParams(current => remapMap(current))
     setParamChoices(current => remapMap(current))
@@ -551,6 +589,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       const known = new Set(groupModels.map(model => textOf(model, 'id')))
       setCandidates(current => new Map(current).set(gid, found))
       setPicked(current => new Map(current).set(gid, new Set(found.filter(model => !known.has(model.id)).map(model => model.id))))
+      setFilters(current => new Map(current).set(gid, ''))
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error))
     } finally {
@@ -584,12 +623,30 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     patchGroup(groups.findIndex(g => textOf(g, 'id') === gid), { models: merged })
     setCandidates(current => new Map(current).set(gid, undefined as never))
     setPicked(current => new Map(current).set(gid, new Set()))
+    setFilters(current => new Map(current).set(gid, ''))
   }
 
   const toggle = (gid: string, id: string): void => {
     setPicked(current => {
       const next = new Set(current.get(gid) ?? new Set<string>())
       if (!next.delete(id)) next.add(id)
+      return new Map(current).set(gid, next)
+    })
+  }
+
+  /** Select or deselect every candidate currently visible under the group filter. */
+  const toggleAll = (gid: string): void => {
+    const filter = filters.get(gid) ?? ''
+    const visible = (candidates.get(gid) ?? []).filter(model => matchesFilter(model, filter))
+    if (visible.length === 0) return
+    const selected = picked.get(gid) ?? new Set<string>()
+    const allSelected = visible.every(model => selected.has(model.id))
+    setPicked(current => {
+      const next = new Set(current.get(gid) ?? new Set<string>())
+      for (const model of visible) {
+        if (allSelected) next.delete(model.id)
+        else next.add(model.id)
+      }
       return new Map(current).set(gid, next)
     })
   }
@@ -693,14 +750,24 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         {groups.length === 0 ? <p className="newapi-empty">{t('noGroups')}</p> : null}
         {groups.map((group, index) => {
           const gid = textOf(group, 'id').trim()
+          const mode = modeOf(group)
           const ref = groupCredRef(gid.length > 0 ? gid : 'newapi')
           const cred = credentials[ref]
+          // Official-direct facts: the group's official credential ref, its
+          // stored/locked state, and the write-only key draft buffer.
+          const officialRef = groupOfficialCredRef(gid.length > 0 ? gid : 'newapi')
+          const officialCred = mode === 'official-direct' ? credentials[officialRef] : undefined
+          const officialKeyDraft = mode === 'official-direct' ? keyDrafts[officialRef] ?? '' : ''
           const expanded = expandedGroups.has(gid)
-          const groupModels = modelsOf(group)
+          const groupModels = mode === 'official-direct' ? [] : modelsOf(group)
           const groupProxy = proxies.get(gid) ?? { enabled: false, url: DEFAULT_PROXY_URL }
-          const groupParams = params.get(gid)
-          const groupCandidates = candidates.get(gid)
+          const groupParams = mode === 'official-direct' ? undefined : params.get(gid)
+          const groupCandidates = mode === 'official-direct' ? undefined : candidates.get(gid)
           const keyDraft = keyDrafts[ref] ?? ''
+          const groupFilter = filters.get(gid) ?? ''
+          const visible = (groupCandidates ?? []).filter(model => matchesFilter(model, groupFilter))
+          const selected = picked.get(gid) ?? new Set<string>()
+          const allVisibleSelected = visible.length > 0 && visible.every(model => selected.has(model.id))
 
           return (
             <div key={index} className="newapi-group">
@@ -720,10 +787,15 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                   onChange={(event) => { patchGroup(index, { name: event.target.value }) }}
                 />
                 <span className="newapi-badge" title={t('groupRoute')}>{groupRoute(gid)}</span>
-                {apiTypeOf(group) === 'responses' ? <span className="newapi-badge" title={t('apiTypeResponsesHint')}>{t('apiTypeResponses')}</span> : null}
-                <span className={`newapi-statusdot ${cred?.configured === true ? 'newapi-statusdot--ok' : 'newapi-statusdot--warn'}`}
-                  title={cred?.configured === true ? t('keyStored') : t('keyMissing')} />
-                <span className="newapi-count">{`${String(groupModels.length)} ${t('models')}`}</span>
+                {mode === 'official-direct'
+                  ? <span className="newapi-badge" title={t('modeOfficialHint')}>{t('officialBadge')}</span>
+                  : null}
+                {mode === 'newapi' && apiTypeOf(group) === 'responses' ? <span className="newapi-badge" title={t('apiTypeResponsesHint')}>{t('apiTypeResponses')}</span> : null}
+                <span
+                  className={`newapi-statusdot ${(mode === 'official-direct' ? officialCred?.configured === true : cred?.configured === true) ? 'newapi-statusdot--ok' : 'newapi-statusdot--warn'}`}
+                  title={(mode === 'official-direct' ? officialCred?.configured === true : cred?.configured === true) ? t('keyStored') : t('keyMissing')}
+                />
+                <span className="newapi-count">{mode === 'official-direct' ? t('officialBadge') : `${String(groupModels.length)} ${t('models')}`}</span>
                 <button
                   type="button" className="newapi-iconbutton newapi-iconbutton--danger"
                   aria-label={`${t('removeGroup')} ${String(index + 1)}`}
@@ -752,96 +824,142 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                     </div>
 
                     <div className="newapi-field">
-                      <label htmlFor={`newapi-key-${index}`}>{t('keyInput')}</label>
-                      <input
-                        id={`newapi-key-${index}`} type="password" autoComplete="off" className="newapi-input"
-                        disabled={cred?.locked === true}
-                        aria-label={`${t('keyInput')} ${String(index + 1)}`}
-                        placeholder={cred?.locked === true
-                          ? t('keyEnvLocked')
-                          : cred?.configured === true ? t('keyStored') : t('keyMissing')}
-                        value={keyDraft}
-                        onChange={(event) => {
-                          setKeyDrafts(current => ({ ...current, [ref]: event.target.value }))
-                        }}
-                      />
-                    </div>
-
-                    <div className="newapi-field">
-                      <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
-                      <input
-                        id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
-                        value={textOf(group, 'baseURL')}
-                        aria-label={`${t('baseUrl')} ${String(index + 1)}`}
-                        onChange={(event) => { patchGroup(index, { baseURL: event.target.value }) }}
-                      />
-                    </div>
-
-                    <div className="newapi-field">
-                      <label htmlFor={`newapi-type-${index}`}>{t('apiType')}</label>
+                      <label htmlFor={`newapi-mode-${index}`}>{t('mode')}</label>
                       <select
-                        id={`newapi-type-${index}`} className="newapi-select"
-                        aria-label={`${t('apiType')} ${String(index + 1)}`}
-                        value={apiTypeOf(group)}
-                        onChange={(event) => { patchGroup(index, { apiType: event.target.value }) }}
+                        id={`newapi-mode-${index}`} className="newapi-select"
+                        aria-label={`${t('mode')} ${String(index + 1)}`}
+                        value={modeOf(group)}
+                        onChange={(event) => { patchGroup(index, { mode: event.target.value }) }}
                       >
-                        <option value="chat">{t('apiTypeChat')}</option>
-                        <option value="responses">{t('apiTypeResponses')}</option>
+                        <option value="newapi">{t('modeNewapi')}</option>
+                        <option value="official-direct">{t('modeOfficial')}</option>
                       </select>
-                      {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
+                      {modeOf(group) === 'official-direct' ? <span className="newapi-hint">{t('modeOfficialHint')}</span> : null}
                     </div>
 
-                    <div className="newapi-proxyrow">
-                      <label>
-                        <input
-                          type="checkbox" checked={groupProxy.enabled}
-                          aria-label={`${t('proxyToggle')} ${String(index + 1)}`}
-                          onChange={(event) => {
-                            setProxies(current => new Map(current).set(gid, { ...groupProxy, enabled: event.target.checked }))
-                          }}
-                        />
-                        {t('proxyToggle')}
-                      </label>
-                      {groupProxy.enabled
-                        ? (
-                          <input
-                            className="newapi-input" type="text" style={{ maxWidth: 220 }}
-                            aria-label={`${t('proxyUrl')} ${String(index + 1)}`} placeholder={DEFAULT_PROXY_URL}
-                            value={groupProxy.url}
-                            onChange={(event) => {
-                              setProxies(current => new Map(current).set(gid, { ...groupProxy, url: event.target.value }))
-                            }}
-                          />
-                        )
-                        : null}
-                    </div>
+                    {modeOf(group) === 'official-direct'
+                      ? (
+                        <>
+                          <div className="newapi-field">
+                            <label htmlFor={`newapi-okey-${index}`}>{t('officialKeyInput')}</label>
+                            <input
+                              id={`newapi-okey-${index}`} type="password" autoComplete="off" className="newapi-input"
+                              disabled={officialCred?.locked === true}
+                              aria-label={`${t('officialKeyInput')} ${String(index + 1)}`}
+                              placeholder={officialCred?.locked === true
+                                ? t('keyEnvLocked')
+                                : officialCred?.configured === true ? t('keyStored') : t('keyMissing')}
+                              value={officialKeyDraft}
+                              onChange={(event) => {
+                                setKeyDrafts(current => ({ ...current, [officialRef]: event.target.value }))
+                              }}
+                            />
+                          </div>
 
-                    <section className="newapi-catalog" aria-label={`${t('models')} ${String(index + 1)}`}>
-                      <div className="newapi-catalog-head">
-                        <span className="newapi-catalog-title">{t('models')}</span>
-                        <div className="newapi-catalog-actions" style={{ display: 'flex', gap: 4 }}>
-                          <button type="button" className="newapi-linkbutton" disabled={busy} onClick={() => { void fetchModels(gid) }}>
-                            {busy ? t('fetching') : t('fetchModels')}
-                          </button>
-                          <button type="button" className="newapi-linkbutton" disabled={paramsBusy} onClick={() => { void updateParams(gid) }}>
-                            {paramsBusy ? t('paramsFetching') : t('updateParams')}
-                          </button>
-                          <button type="button" className="newapi-linkbutton" disabled={busy || groupModels.length === 0} onClick={() => { clearModels(gid) }}>
-                            {t('clearModels')}
-                          </button>
-                        </div>
-                      </div>
-                      {groupModels.length === 0 ? <p className="newapi-empty">{t('modelsEmpty')}</p> : null}
-                      {groupModels.map((model, mIndex) => {
-                        const rowExpanded = (expandedModels.get(gid) ?? new Set<number>()).has(mIndex)
-                        return (
-                          <div key={mIndex} className="newapi-entry">
-                            <div className="newapi-modelrow">
+                          <div className="newapi-field">
+                            <label htmlFor={`newapi-obase-${index}`}>{t('officialBaseUrl')}</label>
+                            <input
+                              id={`newapi-obase-${index}`} type="text" className="newapi-input" placeholder={t('officialBaseUrlPlaceholder')}
+                              value={textOf(group, 'officialBaseURL')}
+                              aria-label={`${t('officialBaseUrl')} ${String(index + 1)}`}
+                              onChange={(event) => { patchGroup(index, { officialBaseURL: event.target.value }) }}
+                            />
+                          </div>
+                        </>
+                      )
+                      : (
+                        <>
+                          <div className="newapi-field">
+                            <label htmlFor={`newapi-key-${index}`}>{t('keyInput')}</label>
+                            <input
+                              id={`newapi-key-${index}`} type="password" autoComplete="off" className="newapi-input"
+                              disabled={cred?.locked === true}
+                              aria-label={`${t('keyInput')} ${String(index + 1)}`}
+                              placeholder={cred?.locked === true
+                                ? t('keyEnvLocked')
+                                : cred?.configured === true ? t('keyStored') : t('keyMissing')}
+                              value={keyDraft}
+                              onChange={(event) => {
+                                setKeyDrafts(current => ({ ...current, [ref]: event.target.value }))
+                              }}
+                            />
+                          </div>
+
+                          <div className="newapi-field">
+                            <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
+                            <input
+                              id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
+                              value={textOf(group, 'baseURL')}
+                              aria-label={`${t('baseUrl')} ${String(index + 1)}`}
+                              onChange={(event) => { patchGroup(index, { baseURL: event.target.value }) }}
+                            />
+                          </div>
+
+                          <div className="newapi-field">
+                            <label htmlFor={`newapi-type-${index}`}>{t('apiType')}</label>
+                            <select
+                              id={`newapi-type-${index}`} className="newapi-select"
+                              aria-label={`${t('apiType')} ${String(index + 1)}`}
+                              value={apiTypeOf(group)}
+                              onChange={(event) => { patchGroup(index, { apiType: event.target.value }) }}
+                            >
+                              <option value="chat">{t('apiTypeChat')}</option>
+                              <option value="responses">{t('apiTypeResponses')}</option>
+                            </select>
+                            {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
+                          </div>
+
+                          <div className="newapi-proxyrow">
+                            <label>
                               <input
-                                className="newapi-input" type="text" value={textOf(model, 'id')}
-                                placeholder={t('modelId')} aria-label={`${t('modelId')} ${String(mIndex + 1)}`}
-                                onChange={(event) => { patchModel(gid, mIndex, { id: event.target.value }) }}
+                                type="checkbox" checked={groupProxy.enabled}
+                                aria-label={`${t('proxyToggle')} ${String(index + 1)}`}
+                                onChange={(event) => {
+                                  setProxies(current => new Map(current).set(gid, { ...groupProxy, enabled: event.target.checked }))
+                                }}
                               />
+                              {t('proxyToggle')}
+                            </label>
+                            {groupProxy.enabled
+                              ? (
+                                <input
+                                  className="newapi-input" type="text" style={{ maxWidth: 220 }}
+                                  aria-label={`${t('proxyUrl')} ${String(index + 1)}`} placeholder={DEFAULT_PROXY_URL}
+                                  value={groupProxy.url}
+                                  onChange={(event) => {
+                                    setProxies(current => new Map(current).set(gid, { ...groupProxy, url: event.target.value }))
+                                  }}
+                                />
+                              )
+                              : null}
+                          </div>
+
+                          <section className="newapi-catalog" aria-label={`${t('models')} ${String(index + 1)}`}>
+                            <div className="newapi-catalog-head">
+                              <span className="newapi-catalog-title">{t('models')}</span>
+                              <div className="newapi-catalog-actions" style={{ display: 'flex', gap: 4 }}>
+                                <button type="button" className="newapi-linkbutton" disabled={busy} onClick={() => { void fetchModels(gid) }}>
+                                  {busy ? t('fetching') : t('fetchModels')}
+                                </button>
+                                <button type="button" className="newapi-linkbutton" disabled={paramsBusy} onClick={() => { void updateParams(gid) }}>
+                                  {paramsBusy ? t('paramsFetching') : t('updateParams')}
+                                </button>
+                                <button type="button" className="newapi-linkbutton" disabled={busy || groupModels.length === 0} onClick={() => { clearModels(gid) }}>
+                                  {t('clearModels')}
+                                </button>
+                              </div>
+                            </div>
+                            {groupModels.length === 0 ? <p className="newapi-empty">{t('modelsEmpty')}</p> : null}
+                            {groupModels.map((model, mIndex) => {
+                              const rowExpanded = (expandedModels.get(gid) ?? new Set<number>()).has(mIndex)
+                              return (
+                                <div key={mIndex} className="newapi-entry">
+                                  <div className="newapi-modelrow">
+                                    <input
+                                      className="newapi-input" type="text" value={textOf(model, 'id')}
+                                      placeholder={t('modelId')} aria-label={`${t('modelId')} ${String(mIndex + 1)}`}
+                                      onChange={(event) => { patchModel(gid, mIndex, { id: event.target.value }) }}
+                                    />
                               <input
                                 className="newapi-input" type="text" value={textOf(model, 'name')}
                                 placeholder={t('modelName')} aria-label={`${t('modelName')} ${String(mIndex + 1)}`}
@@ -950,15 +1068,28 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                       </button>
                     </section>
 
-                    {groupCandidates === undefined ? null : (
+                    {modeOf(group) === 'newapi' && groupCandidates !== undefined ? (
                       <div className="newapi-candidates">
-                        <strong>{t('fetchTitle')}</strong>
+                        <div className="newapi-candidates-head">
+                          <strong>{t('fetchTitle')}</strong>
+                          <button type="button" className="newapi-linkbutton" disabled={visible.length === 0} onClick={() => { toggleAll(gid) }}>
+                            {allVisibleSelected ? t('fetchUnselectAll') : t('fetchSelectAll')}
+                          </button>
+                        </div>
+                        <input
+                          className="newapi-input newapi-candidates-search" type="text"
+                          placeholder={t('fetchSearch')} aria-label={t('fetchSearch')}
+                          value={groupFilter}
+                          onChange={(event) => {
+                            setFilters(current => new Map(current).set(gid, event.target.value))
+                          }}
+                        />
                         <ul>
-                          {groupCandidates.map(model => (
+                          {visible.map(model => (
                             <li key={model.id}>
                               <label>
                                 <input
-                                  type="checkbox" checked={(picked.get(gid) ?? new Set<string>()).has(model.id)}
+                                  type="checkbox" checked={selected.has(model.id)}
                                   onChange={() => { toggle(gid, model.id) }}
                                 />
                                 {' '}
@@ -967,17 +1098,17 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                             </li>
                           ))}
                         </ul>
-                        <button type="button" className="newapi-button newapi-button--primary" disabled={(picked.get(gid) ?? new Set<string>()).size === 0} onClick={() => { adopt(gid) }}>
+                        <button type="button" className="newapi-button newapi-button--primary" disabled={selected.size === 0} onClick={() => { adopt(gid) }}>
                           {t('fetchAdopt')}
                         </button>
                         {' '}
-                        <button type="button" className="newapi-button" onClick={() => { setCandidates(current => new Map(current).set(gid, undefined as never)); setPicked(current => new Map(current).set(gid, new Set())) }}>
+                        <button type="button" className="newapi-button" onClick={() => { setCandidates(current => new Map(current).set(gid, undefined as never)); setPicked(current => new Map(current).set(gid, new Set())); setFilters(current => new Map(current).set(gid, '')) }}>
                           {t('fetchCancel')}
                         </button>
                       </div>
-                    )}
+                     ) : null}
 
-                    {groupParams === undefined ? null : (
+                    {modeOf(group) === 'newapi' && groupParams !== undefined ? (
                       <div className="newapi-params" ref={paramsRef}>
                         <strong>{t('paramsTitle')}</strong>
                         <p className="newapi-params-summary">{
@@ -1047,7 +1178,9 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                           </button>
                         </div>
                       </div>
-                    )}
+                     ) : null}
+                        </>
+                      )}
                   </div>
                 )
                 : null}

@@ -602,6 +602,163 @@ function stubModelsListing() {
   assert.equal(failure.failure.code, 'server_error')
 }
 
+// ── Block J: the official-direct mode delegates to the official adapter ──
+// A group whose mode is 'official-direct' keeps its newapi-<id> provider
+// route but delegates stream/listModels/resolveModel/discovery to the
+// official DeepSeek adapter: official telemetry headers on the wire,
+// reasoning blocks translated from the official SSE shape, effort control
+// riding as the official thinking/reasoning_effort fields, and the model
+// catalog served from the official adapter's built-in list. The gateway
+// fields of the group are inert in this mode (a half-typed gateway base URL
+// must not gate a mode that never uses it).
+{
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(FakeCredentials, { deepseek_official: 'official-key' })
+  await mountPlugin(ctx, { groups: [{
+    id: 'newapi',
+    name: 'NewAPI',
+    mode: 'official-direct',
+    // Inert in official-direct mode: invalid as a gateway base, never used.
+    baseURL: 'not-a-gateway-url',
+    models: [{ id: 'stale-gateway-model' }],
+  }] })
+
+  // listModels serves the official built-in catalog, not the group's stale
+  // gateway models.
+  const listed = await ctx.llm.listModels('newapi')
+  const listedIds = listed.map(model => model.id)
+  assert.ok(listedIds.includes('deepseek-v4-flash'), 'official catalog includes deepseek-v4-flash')
+  assert.ok(!listedIds.includes('stale-gateway-model'), 'gateway catalog is inert in official-direct mode')
+
+  // resolveModel carries the official context window and the official
+  // reasoning-effort selector (off/low/high/max), not models.dev facts.
+  const resolved = await ctx.llm.resolveModelInfo('newapi', 'deepseek-v4-flash')
+  assert.equal(resolved.context.contextWindow, 1_000_000)
+  assert.deepEqual(resolved.reasoning.efforts.map(effort => effort.id), ['off', 'low', 'high', 'max'])
+
+  // Discovery answers the official catalog with official context windows,
+  // offline — no gateway /models call, no credential on the wire.
+  const discovered = await ctx.llm.discoverModels('llm-newapi', { provider: 'newapi' })
+  assert.ok(discovered.some(model => model.id === 'deepseek-v4-flash' && model.contextWindow === 1_000_000))
+
+  // The key resolves from the group's official credential ref; the gateway
+  // ref stays untouched so switching modes keeps both keys.
+  const originalFetch = globalThis.fetch
+  let asked
+  globalThis.fetch = async (url, init) => {
+    asked = {
+      url: String(url),
+      auth: new Headers(init?.headers).get('authorization') ?? '',
+      userId: new Headers(init?.headers).get('x-deepseek-harness-user-id') ?? '',
+      body: JSON.parse(String(init?.body ?? '{}')),
+    }
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'thinking hard ' } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'about it' } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'The answer.' } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 8 } })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('')
+    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+  let chunks
+  try {
+    chunks = []
+    for await (const chunk of ctx.llm.stream({
+      provider: 'newapi',
+      model: 'deepseek-v4-flash',
+      reasoningEffort: 'high',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    })) chunks.push(chunk)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // The request hit the OFFICIAL endpoint with the official credential and
+  // telemetry header, and the explicit effort rode the official fields.
+  assert.equal(asked.url, 'https://api.deepseek.com/chat/completions')
+  assert.equal(asked.auth, 'Bearer official-key')
+  assert.ok(asked.userId.length > 0, 'official telemetry user-id header rides the request')
+  assert.equal(asked.body.thinking.type, 'enabled')
+  assert.equal(asked.body.reasoning_effort, 'high')
+
+  // The stream translated the official reasoning_content shape into a
+  // reasoning block, then text, with a clean stop finish.
+  const ended = chunks.filter(chunk => chunk.type === 'block-end')
+  const reasoning = ended.find(chunk => chunk.block.type === 'reasoning')
+  const text = ended.find(chunk => chunk.block.type === 'text')
+  assert.equal(reasoning.block.text, 'thinking hard about it')
+  assert.equal(text.block.text, 'The answer.')
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+
+  // Without the official credential stored, the failure surfaces as an
+  // error finish naming the official-direct mode and its reference, not
+  // the gateway's (the runtime reports provider failures on the stream).
+  const ctx2 = new Context()
+  await ctx2.plugin(LlmRuntime)
+  await ctx2.plugin(FakeCredentials, { newapi: 'gateway-key' })
+  await mountPlugin(ctx2, { groups: [{ id: 'newapi', mode: 'official-direct', baseURL: 'http://gw.local:3000/v1' }] })
+  const missingKeyChunks = []
+  for await (const chunk of ctx2.llm.stream({
+    provider: 'newapi',
+    model: 'deepseek-v4-flash',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })) missingKeyChunks.push(chunk)
+  const missing = missingKeyChunks.at(-1)
+  assert.equal(missing.type, 'finish')
+  assert.equal(missing.reason.kind, 'error')
+  assert.equal(missing.reason.failure.code, 'MISSING_CREDENTIAL')
+  assert.ok(missing.reason.failure.message.includes('official-direct mode'))
+  assert.ok(missing.reason.failure.message.includes('deepseek_official'))
+}
+
+// ── Block K: official-direct settings validation and newapi regression ──
+{
+  // The settings write point accepts an official-direct section whose
+  // gateway baseURL is a half-typed draft (inert in that mode) but rejects
+  // an invalid officialBaseURL.
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(MemorySettings, {})
+  await ctx.plugin(FakeCredentials, { newapi: 'key-k' })
+  await mountPlugin(ctx)
+  await ctx.settings.update('llm-newapi', {
+    groups: [{ id: 'newapi', mode: 'official-direct', baseURL: 'draft' }],
+  })
+  await assert.rejects(
+    ctx.settings.update('llm-newapi', {
+      groups: [{ id: 'newapi', mode: 'official-direct', officialBaseURL: 'ftp://nope' }],
+    }),
+    (error) => error.message.includes('officialBaseURL must be an absolute http(s) URL'),
+  )
+  // An invalid officialApiKeyRef (hyphens are outside the ref charset)
+  // rejects at the write too.
+  await assert.rejects(
+    ctx.settings.update('llm-newapi', {
+      groups: [{ id: 'newapi', mode: 'official-direct', officialApiKeyRef: 'bad-ref' }],
+    }),
+    (error) => error.message.includes('officialApiKeyRef'),
+  )
+  // A custom officialApiKeyRef is honored on the wire.
+  await ctx.settings.update('llm-newapi', {
+    groups: [{ id: 'newapi', mode: 'official-direct', officialApiKeyRef: 'my_official_key' }],
+  })
+
+  // Default mode regression: a section without mode stays a gateway group.
+  await ctx.settings.update('llm-newapi', {
+    groups: [{ id: 'newapi', baseURL: 'http://gw.local:3000/v1' }],
+  })
+  const { asked, restore } = stubModelsListing()
+  try {
+    const found = await ctx.llm.discoverModels('llm-newapi', { provider: 'newapi' })
+    assert.equal(found.length, 2)
+  } finally {
+    restore()
+  }
+  assert.equal(asked.url, 'http://gw.local:3000/v1/models')
+}
+
 // ── Block H (optional): real-catalog check against the local dev cache ──
 // .cache/models-dev.api.json (npm run cache:models-dev, gitignored) carries
 // the catalog's real field shapes; when present, matchModelsDev is exercised

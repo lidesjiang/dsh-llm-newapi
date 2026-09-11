@@ -4,10 +4,11 @@
 
 An LLM provider plugin that adds **NewAPI** to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh). **Zero modifications to dsh itself.**
 
-- Provider route id: `newapi`
+- Provider route id: `newapi` (legacy group) / `newapi-<id>` (per group)
 - Display name: `NewAPI`
 - Shape: LLM Provider plugin — implements the `LlmAdapter` seam from `@deepseek-ai/dsh-llm`; NewAPI is an OpenAI-compatible gateway (`POST {baseURL}/chat/completions`, `GET {baseURL}/models`, baseURL includes `/v1`)
 - Dual-face structure: host side (adapter + model discovery) + browser side (a "NewAPI" settings page in the dsh web settings panel, including "Fetch model info")
+- Per-group connection mode (v0.11.0): `newapi` (default, relay through the gateway) or `official-direct` — delegate to the official `@deepseek-ai/dsh-llm-deepseek` adapter and hit the DeepSeek official API directly with your own base URL + key, bypassing gateway wire-format loss (full reasoning blocks, `reasoning_effort`, tool calls)
 
 Design decisions and trade-off analysis live in [DESIGN.md](DESIGN.md); reference implementation: `deepseek-harness/packages/llm/llm-deepseek`.
 
@@ -63,7 +64,7 @@ dsh plugin --profile web add link:$(pwd)
 
 > **Missing-peer warnings at install time are expected and can be ignored**: `react`/`cordis`/`dsh-llm`/`dsh-settings`/`schemastery` etc. are provided at runtime by the dsh host app; declaring them as `peerDependencies` is exactly how the plugin says "don't install your own copy". The profile's `autoInstallPeers: false` makes pnpm report them as missing. Every dsh plugin shows this WARN on install (dsh-at-file is the same); installation succeeds regardless. Do not install that list manually or enable autoInstallPeers — it causes duplicate cordis services and the plugin silently failing.
 
-After install: a "NewAPI" page appears in the settings panel → fill in the API key and the gateway address (including `/v1`) → "Fetch model info" pulls the model list and lets you pick chat models (embedding / rerank / ranker are filtered automatically) → save. The `newapi` route's models then show up in the model picker (composer).
+After install: a "NewAPI" page appears in the settings panel → fill in the API key and the gateway address (including `/v1`) → "Fetch model info" pulls the model list and lets you pick chat models (embedding / rerank / ranker are filtered automatically) → save. The `newapi` route's models then show up in the model picker (composer). Each group's card also carries a **connection mode** selector: `newapi` (gateway relay, default) or `official-direct` (direct DeepSeek official API); switching modes persists per group, and the two modes keep independent API keys.
 
 ## Configuration (cordis.yml entry config; after install the `llm-newapi:` section in settings.yaml hot-reloads and overrides it)
 
@@ -72,6 +73,14 @@ After install: a "NewAPI" page appears in the settings panel → fill in the API
   name: dsh-llm-newapi
   config:
     baseURL: http://gw.local:3000/v1   # include the /v1 prefix; falls back to env NEWAPI_BASE_URL → placeholder
+    # mode: official-direct            # connection mode: 'newapi' (default, relay through the gateway)
+    #                                  # or 'official-direct' (delegate to the official DeepSeek adapter;
+    #                                  # baseURL/apiType/proxy and the model catalog become inert)
+    # officialBaseURL: https://api.deepseek.com   # official-direct only; no /v1 prefix; defaults to
+    #                                              # https://api.deepseek.com when omitted
+    # officialApiKeyRef: my_official_key          # official-direct only; credential reference for the
+    #                                              # official key, defaults to deepseek_official_<id>
+    #                                  # (must match /^[A-Za-z_][A-Za-z0-9_]*$/ — no hyphens)
     # apiType: chat                    # wire protocol: 'chat' (default, POST {baseURL}/chat/completions)
     #                                   or 'responses' (OpenAI Responses API, POST {baseURL}/responses,
     #                                   for agents / multi-step output / tool calling)
@@ -88,9 +97,17 @@ After install: a "NewAPI" page appears in the settings panel → fill in the API
     #     glm: zhipuai                 #   e.g. use the ZhipuAI open platform data instead
     #   models:                        #   per-id exact → provider (takes precedence over family)
     #     tencent/Hunyuan-MT-7B: nano-gpt
+    # groups:                          # multiple gateways: each group is its own newapi-<id> provider route
+    #   - id: work                     #   (the legacy flat fields above are the implicit 'newapi' group)
+    #     baseURL: http://gw-work:3000/v1
+    #   - id: ds-official
+    #     mode: official-direct        #   official-direct group: requests go straight to officialBaseURL
+    #     officialBaseURL: https://api.deepseek.com
 ```
 
-**API key**: not a config item — it lives under the fixed `newapi` reference in the credentials store, and its only configuration surface is the web settings page (takes effect immediately on write, resolved per request). The plugin never reads the key from environment variables: the top read-only layer of the credentials service is inherited from the environment, so a `NEWAPI_API_KEY`-style reference would be shadowed by an identically-named env var and lock the front-end input; hence the fixed reference name `newapi`. Without a key, the first request fails with `MISSING_CREDENTIAL` and points to the settings page — it never errors at load time.
+**Connection mode (v0.11.0)**: `mode: official-direct` switches a group from the NewAPI gateway to the official DeepSeek API. The plugin delegates the whole request path to the official `@deepseek-ai/dsh-llm-deepseek` adapter (pinned to the same `0.1.2-rc.1` line as this plugin's other deps), so reasoning blocks stream natively (`reasoning_content` → harness reasoning chunks), `reasoning_effort` off/low/high/max is declared for every model, tool calls use the official wire format, and model discovery serves the official built-in catalog (deepseek-v4-flash / v4-pro / v4-flash-vision-exp, 1M context) offline instead of probing the gateway. The official API key is stored under a separate credential reference (`deepseek_official_<id>` by default, or your `officialApiKeyRef`) — switching a group between modes never overwrites the other mode's key. In official-direct mode the gateway fields (baseURL, apiType, proxy) and the models.dev parameter panel are inert: an unset or half-typed gateway URL no longer blocks saving.
+
+**API key**: not a config item — it lives under the fixed `newapi` reference in the credentials store, and its only configuration surface is the web settings page (takes effect immediately on write, resolved per request). The plugin never reads the key from environment variables: the top read-only layer of the credentials service is inherited from the environment, so a `NEWAPI_API_KEY`-style reference would be shadowed by an identically-named env var and lock the front-end input; hence the fixed reference name `newapi`. Without a key, the first request fails with `MISSING_CREDENTIAL` and points to the settings page — it never errors at load time. official-direct groups keep their key under a separate reference (`deepseek_official` / `deepseek_official_<id>`, or the configured `officialApiKeyRef`) — the two modes never share or overwrite each other's key, and a missing official key fails the same way with the reference name in the message.
 
 **Model discovery**: `GET {baseURL}/models`; only models that can serve chat-completions are adopted — embedding / rerank / ranker families are filtered by naming convention (configurable).
 
@@ -117,6 +134,10 @@ npm run cache:models-dev      # cache models.dev/api.json locally to .cache/ (gi
 After changing source, re-run `npm run build` and **commit `lib/`** — `github:` installs run from the committed artifacts, and the CI "Committed artifacts are current" step rejects stale outputs.
 
 ## Status
+
+v0.11.0: official-direct connection mode — each group (or the legacy flat config) now selects `mode: official-direct` to bypass the NewAPI gateway and hit the DeepSeek official API directly. The adapter delegates the entire request path to the official `@deepseek-ai/dsh-llm-deepseek` adapter (bundled as a pinned `0.1.2-rc.1` dependency, the same line as this plugin's peer stack — no parallel copies), reusing its serialization (`thinking` + `reasoning_effort`, official telemetry headers), reasoning-block streaming, tool calls, vision/Files-API attachment path, and the built-in model catalog (served offline, 1M context, effort off/low/high/max on every model). The official key lives under a per-group `deepseek_official_<id>` credential reference (or a configured `officialApiKeyRef`), isolated from both the gateway key and the official plugin's own `DEEPSEEK_API_KEY`. Settings page: per-group mode selector; official-direct groups show the official base URL (default `https://api.deepseek.com`, no `/v1`) and official key input, hide the gateway-only controls, and carry an "official" badge; switching back to `newapi` restores the gateway fields untouched. Also fixed a pre-existing crash when a group's `baseURL` was left empty (the UI can save a group before a URL is typed): it now falls back to the placeholder instead of throwing. CI boot gate updated for the dsh 0.1.2 serving model (token cookie + composed combo-URL assertions; dsh pinned to the matching line).
+
+v0.10.0: migrated to the dsh 0.1.2-rc.1 line — all `@deepseek-ai/*` peers moved to `^0.1.2-rc.1` (cordis 4, schemastery 3.18); the client half dropped the removed `dsh-client-runtime` package (ClientContext → cordis Context) and the `ctx.connection.api` face in favor of the `ctx.remote` projection; `settings.mutate`/`discoverModels` RPC signatures followed the new protocol. No behavior change on the wire.
 
 v0.9.0: per-group API type — each gateway group now selects its wire protocol: `chat` (default, `POST {baseURL}/chat/completions`) or `responses` (the OpenAI Responses API, `POST {baseURL}/responses`, suited to agents / multi-step output / tool calling). A responses group serializes the Responses-API shape (`instructions`, role messages plus `function_call` / `function_call_output` input items, `max_output_tokens`, `reasoning.effort`, top-level tool `name`) and translates Responses-API SSE events (`output_text.delta`, `output_item.added`, `function_call_arguments.delta`, terminated by `completed` / `incomplete` / `failed`) into the same harness stream contract — `/responses` streams need no `[DONE]` sentinel. Settings page: per-group API-type selector plus a header badge on responses groups.
 

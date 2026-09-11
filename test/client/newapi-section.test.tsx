@@ -255,6 +255,68 @@ describe('model catalog', () => {
     expect((screen.getByLabelText(`${t('modelId')} 3`) as HTMLInputElement).value).toBe('zhipu/glm-5.3')
   })
 
+  it('toggles all candidates through the select-all/deselect-all button', async () => {
+    const api = wireFace({
+      describeAnswer: {
+        writable: true,
+        hasDocument: true,
+        namespaces: [{
+          ns: 'llm-newapi',
+          schema: {},
+          value: storedGroups([]),
+          applies: 'live',
+          secrets: [],
+          revision: 7,
+        }],
+      },
+    })
+    api.llm.discoverModels.mockResolvedValueOnce({
+      ok: true,
+      value: [{ id: 'aa-first' }, { id: 'deepseek-chat' }, { id: 'zhipu/glm-5.3' }],
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    await waitFor(() => { expect(screen.getByText(t('fetchModels'))).toBeTruthy() })
+    fireEvent.click(screen.getByText(t('fetchModels')))
+    await waitFor(() => { expect(screen.getByText(t('fetchAdopt'))).toBeTruthy() })
+    // all three are new (empty stored catalog), so the toggle reads deselect-all
+    expect(screen.getByText(t('fetchUnselectAll'))).toBeTruthy()
+
+    fireEvent.click(screen.getByText(t('fetchUnselectAll')))
+    await waitFor(() => { expect(screen.getByText(t('fetchSelectAll'))).toBeTruthy() })
+    expect((screen.getByText(t('fetchAdopt')) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByText(t('fetchSelectAll')))
+    await waitFor(() => { expect(screen.getByText(t('fetchUnselectAll'))).toBeTruthy() })
+    expect((screen.getByText(t('fetchAdopt')) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('filters candidates by substring and restores them when cleared', async () => {
+    const api = wireFace()
+    api.llm.discoverModels.mockResolvedValueOnce({
+      ok: true,
+      value: [{ id: 'aa-first' }, { id: 'deepseek-chat' }, { id: 'zhipu/glm-5.3' }],
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    await waitFor(() => { expect(screen.getByText(t('fetchModels'))).toBeTruthy() })
+    fireEvent.click(screen.getByText(t('fetchModels')))
+    await waitFor(() => { expect(screen.getByText(t('fetchAdopt'))).toBeTruthy() })
+    expect(screen.getAllByRole('listitem')).toHaveLength(3)
+
+    const search = screen.getByLabelText(t('fetchSearch')) as HTMLInputElement
+    fireEvent.change(search, { target: { value: 'deepseek' } })
+    await waitFor(() => { expect(screen.getAllByRole('listitem')).toHaveLength(1) })
+    expect(screen.getAllByRole('listitem')[0].textContent).toContain('deepseek-chat')
+    expect(screen.queryByText(/aa-first/)).toBeNull()
+    expect(screen.queryByText(/zhipu/)).toBeNull()
+
+    fireEvent.change(search, { target: { value: '' } })
+    await waitFor(() => { expect(screen.getAllByRole('listitem')).toHaveLength(3) })
+  })
+
   it('folds capacities behind the row disclosure and adopts K/M entry', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
@@ -397,5 +459,126 @@ describe('API type selection', () => {
     const groups = api.settings.mutate.mock.calls[0][1]
       .find((op: { path: string[] }) => op.path[0] === 'groups').value
     expect(groups[0].apiType).toBeUndefined()
+  })
+})
+
+describe('connection mode (official-direct)', () => {
+  /** The saved groups value of the first mutate call. */
+  function savedGroups(api: ReturnType<typeof wireFace>): Array<Record<string, unknown>> {
+    return api.settings.mutate.mock.calls[0][1]
+      .find((op: { path: string[] }) => op.path[0] === 'groups').value
+  }
+
+  it('defaults to newapi and switches fields when official-direct is selected', async () => {
+    const api = wireFace()
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    // Gateway fields render in the default mode; official fields do not.
+    const picker = await waitFor(() => screen.getByLabelText(`${t('mode')} 1`)) as HTMLSelectElement
+    expect(picker.value).toBe('newapi')
+    expect(screen.getByLabelText(t('baseUrl'))).toBeTruthy()
+    expect(screen.queryByLabelText(t('officialBaseUrl'))).toBeNull()
+
+    fireEvent.change(picker, { target: { value: 'official-direct' } })
+    // The gateway-only fields are gone; the official fields appear.
+    await waitFor(() => { expect(screen.getByLabelText(t('officialBaseUrl'))).toBeTruthy() })
+    expect(screen.queryByLabelText(t('baseUrl'))).toBeNull()
+    expect(screen.queryByLabelText(`${t('apiType')} 1`)).toBeNull()
+    expect(screen.getByLabelText(t('officialKeyInput'))).toBeTruthy()
+
+    // Saving persists the mode and the official base, drops the gateway
+    // fields, and writes the key draft to the group's official ref.
+    fireEvent.change(screen.getByLabelText(t('officialBaseUrl')), { target: { value: 'https://api.deepseek.com' } })
+    fireEvent.change(screen.getByLabelText(t('officialKeyInput')), { target: { value: 'sk-official' } })
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const group = savedGroups(api)[0]
+    expect(group.mode).toBe('official-direct')
+    expect(group.officialBaseURL).toBe('https://api.deepseek.com')
+    expect(group.baseURL).toBeUndefined()
+    expect(group.models).toEqual([])
+    expect(api.credentials.set).toHaveBeenCalledWith('deepseek_official', 'sk-official')
+  })
+
+  it('renders the official badge and fields from storage', async () => {
+    const api = wireFace({
+      describeAnswer: {
+        writable: true,
+        hasDocument: true,
+        namespaces: [{
+          ns: 'llm-newapi',
+          schema: {},
+          value: {
+            groups: [{
+              id: 'newapi',
+              name: 'NewAPI',
+              mode: 'official-direct',
+              officialBaseURL: 'https://api.deepseek.com',
+              baseURL: 'http://gw.local:3000/v1',
+              models: [{ id: 'stale-gateway-model' }],
+            }],
+          },
+          applies: 'live',
+          secrets: [],
+          revision: 7,
+        }],
+      },
+      credentialsAnswer: { newapi: { configured: true, writable: true }, deepseek_official: { configured: true, writable: true } },
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+
+    // The collapsed card already shows the official badge.
+    await waitFor(() => { expect(screen.getAllByText(t('officialBadge')).length).toBeGreaterThan(0) })
+    await expandFirstGroup()
+
+    const picker = await waitFor(() => screen.getByLabelText(`${t('mode')} 1`)) as HTMLSelectElement
+    expect(picker.value).toBe('official-direct')
+    expect((screen.getByLabelText(t('officialBaseUrl')) as HTMLInputElement).value).toBe('https://api.deepseek.com')
+    // The gateway fields are hidden in official-direct mode.
+    expect(screen.queryByLabelText(t('baseUrl'))).toBeNull()
+    expect(screen.queryByLabelText(t('fetchModels'))).toBeNull()
+
+    // Saving keeps the stored official facts (a blank key draft writes nothing).
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const group = savedGroups(api)[0]
+    expect(group.mode).toBe('official-direct')
+    expect(group.officialBaseURL).toBe('https://api.deepseek.com')
+    expect(group.baseURL).toBeUndefined()
+    expect(api.credentials.set).not.toHaveBeenCalled()
+  })
+
+  it('switching back to newapi restores the gateway fields', async () => {
+    const api = wireFace({
+      describeAnswer: {
+        writable: true,
+        hasDocument: true,
+        namespaces: [{
+          ns: 'llm-newapi',
+          schema: {},
+          value: {
+            groups: [{ id: 'newapi', mode: 'official-direct', officialBaseURL: 'https://api.deepseek.com' }],
+          },
+          applies: 'live',
+          secrets: [],
+          revision: 7,
+        }],
+      },
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    await waitFor(() => { expect(screen.getByLabelText(t('officialBaseUrl'))).toBeTruthy() })
+    fireEvent.change(screen.getByLabelText(`${t('mode')} 1`), { target: { value: 'newapi' } })
+    await waitFor(() => { expect(screen.getByLabelText(t('baseUrl'))).toBeTruthy() })
+    expect(screen.queryByLabelText(t('officialBaseUrl'))).toBeNull()
+    expect(screen.getByLabelText(`${t('apiType')} 1`)).toBeTruthy()
+
+    fireEvent.click(screen.getByText(t('apply')))
+    await waitFor(() => { expect(api.settings.mutate).toHaveBeenCalledTimes(1) })
+    const group = savedGroups(api)[0]
+    expect(group.mode).toBeUndefined()
+    expect(group.officialBaseURL).toBeUndefined()
   })
 })

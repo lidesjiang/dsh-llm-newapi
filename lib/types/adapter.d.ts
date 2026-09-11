@@ -7,6 +7,14 @@
  * are emitted and no harness telemetry headers are sent: the mandatory
  * attribution `User-Agent` is the only product identity on the wire.
  *
+ * One mode escapes the gateway entirely: a connection whose `mode` is
+ * `official-direct` delegates `stream` / `listModels` / `resolveModel` /
+ * discovery to an {@link OfficialAdapterDelegate} built from that same
+ * connection snapshot (the official DeepSeek adapter), so reasoning blocks,
+ * `reasoning_effort`, and tool calls reach the official endpoint without
+ * gateway translation loss. The official route itself is never registered —
+ * delegation, not replacement.
+ *
  * @module dsh-llm-newapi/adapter
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
@@ -51,6 +59,14 @@ export interface NewApiCatalogModel {
     vision?: boolean;
 }
 /**
+ * The wire mode of one connection. `newapi` (default, and the behavior when
+ * the field is absent) relays through the OpenAI-compatible gateway;
+ * `official-direct` delegates every model operation to the official
+ * DeepSeek adapter so reasoning blocks, `reasoning_effort`, and tool calls
+ * reach the official endpoint without gateway loss.
+ */
+export type NewApiMode = 'newapi' | 'official-direct';
+/**
  * Validated connection facts for one operation. The plugin's
  * `resolveAdapterOptions` is the one explicit resolve step producing this
  * shape; the adapter trusts it and re-reads it per operation, which is what
@@ -78,6 +94,26 @@ export interface NewApiConnectionOptions {
      * literal key is not a configuration value.
      */
     apiKeyRef: CredentialRef;
+    /**
+     * Wire mode: absent or `newapi` relays through the gateway; `official-direct`
+     * delegates to the official DeepSeek adapter built from
+     * {@link officialBaseURL} and {@link officialApiKeyRef}.
+     */
+    mode?: NewApiMode;
+    /**
+     * DeepSeek official API base used in official-direct mode (no `/v1`
+     * requirement — the official adapter appends `/chat/completions` itself).
+     * Present only while the mode is `official-direct`; the gateway
+     * {@link baseURL} is not validated in that mode.
+     */
+    officialBaseURL?: string;
+    /**
+     * Credential reference for the official API key in official-direct mode;
+     * resolved per request through the same credentials seam as
+     * {@link apiKeyRef}, but stored separately so switching modes never
+     * overwrites one generation's key with the other's.
+     */
+    officialApiKeyRef?: CredentialRef;
     /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
     models: readonly NewApiCatalogModel[];
     /**
@@ -134,6 +170,31 @@ export interface NewApiAdapterOptions {
      * content explicitly instead of silently dropping it.
      */
     resolveImage?: (ref: ImageAttachmentRef, signal: AbortSignal) => Promise<StoredImageAttachment>;
+    /**
+     * Build the official-direct delegate for one connection snapshot: an
+     * object with the official DeepSeek adapter's `stream` / `listModels` /
+     * `resolveModel` surface (the `DeepSeekAdapter` class from
+     * `@deepseek-ai/dsh-llm-deepseek` satisfies it structurally). Called at
+     * most once per connection snapshot — the adapter caches by snapshot
+     * identity, so one config generation reuses one delegate (and its
+     * Files-API upload index). Absent while no group uses official-direct
+     * mode; an official-direct connection without a factory fails loudly.
+     */
+    createOfficialAdapter?: (connection: NewApiConnectionOptions) => OfficialAdapterDelegate;
+}
+/**
+ * The official-adapter surface the official-direct delegation path calls.
+ * Deliberately structural (no import from the pinned dependency): the
+ * transport-only adapter layer stays independent of the official package,
+ * and tests can stub the delegate without its dependency chain.
+ */
+export interface OfficialAdapterDelegate {
+    /** Stream one model call against the official endpoint. */
+    stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /** The official adapter's built-in model catalog. */
+    listModels(provider: string): Promise<readonly LlmModelInfo[]>;
+    /** Official model metadata: context window, reasoning efforts, output caps. */
+    resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
 }
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export declare const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000;
@@ -168,9 +229,12 @@ export declare function matchModelsDev(api: ModelsDevApi, id: string, hints?: Pr
  * step — names the setting to fix instead of surfacing later as an opaque
  * fetch failure.
  * @param raw - the configured or drafted base URL.
+ * @param diagnostic - the error fragment naming the field; the default names
+ *   the gateway `baseURL` (with its `/v1` requirement), official-direct
+ *   passes one for `officialBaseURL` (no `/v1` requirement).
  * @returns the normalized base with no trailing slash.
  */
-export declare function normalizeBaseUrl(raw: string): string;
+export declare function normalizeBaseUrl(raw: string, diagnostic?: string): string;
 /**
  * Derive a human display name from a gateway model id when the listing
  * supplied none: take the last `/` segment (routed ids carry their vendor
@@ -209,7 +273,19 @@ export declare function httpErrorCode(status: number, error?: WireError['error']
  */
 export declare class NewApiAdapter extends LlmAdapter {
     private readonly config;
+    /** Cached official-direct delegate, keyed by connection snapshot identity. */
+    private officialDelegate;
     constructor(config: NewApiAdapterOptions);
+    /**
+     * The official-direct delegate for one connection snapshot. The plugin's
+     * `options(provider)` thunk returns one stable object per config
+     * generation, so identity comparison caches exactly one delegate (and its
+     * Files-API upload index) per generation; a settings change mints the
+     * next one on its first request.
+     * @param connection - the connection snapshot to delegate for.
+     * @returns the official adapter delegate for that snapshot.
+     */
+    private officialAdapterFor;
     providerInfo(provider: string): LlmProviderInfo;
     providerRetryPolicy(provider: string): ResolvedRetryPolicy;
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;

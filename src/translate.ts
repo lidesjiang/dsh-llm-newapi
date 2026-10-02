@@ -388,3 +388,146 @@ export async function* translateResponses(payloads: AsyncIterable<string>): Asyn
   // No terminal event arrived before EOF — the stream is truncated.
   throw new LlmError('Responses-API SSE payload stream ended without a terminal event', 'STREAM_CLOSED')
 }
+
+interface MessagesEvent {
+  type?: string
+  index?: number
+  content_block?: { type?: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }
+  delta?: { type?: string; text?: string; thinking?: string; partial_json?: string; stop_reason?: string }
+  message?: { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } }
+  usage?: { output_tokens?: number }
+  error?: { type?: string; message?: string }
+}
+
+/** Map Anthropic's stop reasons onto the provider-neutral harness contract. */
+function mapMessagesFinishReason(reason: string | undefined): FinishReason {
+  switch (reason) {
+    case 'end_turn':
+    case 'stop_sequence':
+    case undefined: return { kind: 'stop' }
+    case 'tool_use': return { kind: 'tool-calls' }
+    case 'max_tokens': return { kind: 'max-tokens' }
+    default: return { kind: 'error', failure: { message: `model stopped: ${reason}`, code: reason.toUpperCase() } }
+  }
+}
+
+/** Translate Anthropic Messages SSE events into harness StreamChunks. */
+export async function* translateMessages(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk> {
+  let nextIndex = 0
+  const blocks = new Map<number, OpenBlock>()
+  const order: OpenBlock[] = []
+  const closed = new Set<OpenBlock>()
+  let pendingFinish: FinishReason | undefined
+  let pendingUsage: TokenUsage | undefined
+
+  function open(kind: OpenBlock['kind'], wireIndex: number): OpenBlock {
+    const block: OpenBlock = { index: nextIndex++, kind, text: '' }
+    blocks.set(wireIndex, block)
+    order.push(block)
+    return block
+  }
+
+  function* close(block: OpenBlock): Generator<StreamChunk> {
+    if (closed.has(block)) return
+    closed.add(block)
+    yield { type: 'block-end', index: block.index, block: closeBlock(block) }
+  }
+
+  for await (const payload of payloads) {
+    let event: MessagesEvent
+    try { event = JSON.parse(payload) as MessagesEvent } catch {
+      throw new LlmError(`malformed Messages SSE payload: ${payload.slice(0, 120)}`, 'MALFORMED_RESPONSE')
+    }
+
+    switch (event.type) {
+      case 'message_start': {
+        const usage = event.message?.usage
+        if (usage !== undefined) {
+          const input = usage.input_tokens ?? 0
+          const cacheRead = usage.cache_read_input_tokens
+          const cacheWrite = usage.cache_creation_input_tokens
+          pendingUsage = {
+            inputTokens: input,
+            outputTokens: 0,
+            ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
+            ...cacheWrite !== undefined ? { cacheWriteTokens: cacheWrite } : {},
+          }
+        }
+        break
+      }
+      case 'content_block_start': {
+        const wireIndex = event.index ?? 0
+        const source = event.content_block
+        if (source?.type === 'text' || source?.type === 'thinking' || source?.type === 'tool_use') {
+          const kind = source.type === 'thinking' ? 'reasoning' : source.type === 'tool_use' ? 'tool-call' : 'text'
+          const block = open(kind, wireIndex)
+          if (kind === 'tool-call') {
+            if (source.id !== undefined) block.callId = source.id
+            if (source.name !== undefined) block.name = source.name
+            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+            const initial = source.input
+            if (initial !== undefined && typeof initial === 'object' && initial !== null && Object.keys(initial).length > 0) {
+              const fragment = JSON.stringify(initial)
+              block.text += fragment
+              yield { type: 'tool-call-delta', index: block.index, id: ToolCallId(block.callId ?? ''), ...(block.name ? { name: block.name } : {}), argumentsDelta: fragment }
+            }
+          } else {
+            yield { type: 'block-start', index: block.index, blockType: kind }
+            const initial = kind === 'reasoning' ? source.thinking : source.text
+            if (typeof initial === 'string' && initial.length > 0) {
+              block.text = initial
+              yield kind === 'reasoning'
+                ? { type: 'reasoning-delta', index: block.index, text: initial }
+                : { type: 'text-delta', index: block.index, text: initial }
+            }
+          }
+        }
+        break
+      }
+      case 'content_block_delta': {
+        const block = blocks.get(event.index ?? 0)
+        const delta = event.delta
+        if (block === undefined || delta === undefined) break
+        if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text.length > 0) {
+          block.text += delta.text
+          yield { type: 'text-delta', index: block.index, text: delta.text }
+        } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking.length > 0) {
+          block.text += delta.thinking
+          yield { type: 'reasoning-delta', index: block.index, text: delta.thinking }
+        } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+          block.text += delta.partial_json
+          yield { type: 'tool-call-delta', index: block.index, id: ToolCallId(block.callId ?? ''), ...(block.name ? { name: block.name } : {}), argumentsDelta: delta.partial_json }
+        }
+        break
+      }
+      case 'content_block_stop': {
+        const block = blocks.get(event.index ?? 0)
+        if (block !== undefined) yield* close(block)
+        break
+      }
+      case 'message_delta': {
+        if (event.delta?.stop_reason !== undefined) pendingFinish = mapMessagesFinishReason(event.delta.stop_reason)
+        const output = event.usage?.output_tokens
+        if (output !== undefined) pendingUsage = { ...(pendingUsage ?? { inputTokens: 0, outputTokens: 0 }), outputTokens: output }
+        break
+      }
+      case 'message_stop': {
+        for (const block of order) yield* close(block)
+        if (pendingUsage !== undefined) yield { type: 'usage', usage: pendingUsage }
+        const reason = pendingFinish ?? { kind: 'stop' as const }
+        yield {
+          type: 'finish',
+          reason: reason.kind === 'stop' && order.length === 0
+            ? { kind: 'error', failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE } }
+            : reason,
+        }
+        return
+      }
+      case 'error':
+        throw new LlmError(event.error?.message ?? 'Messages API stream error', event.error?.type ?? 'RESPONSE_FAILED')
+      case 'ping':
+        break
+    }
+  }
+  throw new LlmError('Messages API stream ended without message_stop', 'STREAM_CLOSED')
+}

@@ -53,3 +53,5 @@ export declare function mapResponsesUsage(usage: ResponsesUsage): TokenUsage;
  * @returns deltas as they arrive; `block-end`s, `usage`, and `finish` flush on the terminal event.
  */
 export declare function translateResponses(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk>;
+/** Translate Anthropic Messages SSE events into harness StreamChunks. */
+export declare function translateMessages(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk>;

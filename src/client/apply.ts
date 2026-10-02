@@ -69,6 +69,9 @@ const SECTION_CSS = `
 .newapi-button--primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
 .newapi-error { color: var(--dsw-alias-state-error-primary); }
 .newapi-hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+.newapi-curl-labelrow, .newapi-curl-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.newapi-curl-panel { border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 8px; background: var(--dsw-alias-bg-layer-2); }
+.newapi-curl-editor { box-sizing: border-box; width: 100%; min-height: 260px; resize: vertical; margin: 6px 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; overflow: auto; }
 
 /* Gateway group cards: one bordered card per group, a header row with
    name/route badge/status/count, and an expanding body. */

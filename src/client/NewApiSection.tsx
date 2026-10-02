@@ -164,8 +164,157 @@ function groupOfficialCredRef(id: string): string {
 }
 
 /** Wire protocol of a group: `chat` (default) or `responses`. */
-function apiTypeOf(group: GroupDraft): 'chat' | 'responses' {
-  return textOf(group, 'apiType') === 'responses' ? 'responses' : 'chat'
+function apiTypeOf(group: GroupDraft): 'chat' | 'responses' | 'messages' {
+  const apiType = textOf(group, 'apiType')
+  return apiType === 'responses' || apiType === 'messages' ? apiType : 'chat'
+}
+
+/** Quote one argument for a POSIX shell command. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+/** Build a representative curl request using the same endpoint and body shape as the adapter. */
+function curlExample(baseURL: string, apiType: 'chat' | 'responses' | 'messages', model: string): string {
+  const claude = apiType === 'messages'
+  const endpoint = `${baseURL.trim().replace(/\/+$/, '')}/${claude ? 'messages' : apiType === 'responses' ? 'responses' : 'chat/completions'}`
+  const body = claude
+    ? { model, max_tokens: 1024, messages: [{ role: 'user', content: 'Hello!' }], stream: true }
+    : apiType === 'responses'
+      ? { model, input: [{ role: 'user', content: 'Hello!' }], stream: true, stream_options: { include_usage: true } }
+      : { model, messages: [{ role: 'user', content: 'Hello!' }], stream: true, stream_options: { include_usage: true } }
+  return [
+    `curl --no-buffer --request POST ${shellQuote(endpoint)} \\`,
+    `  --header ${shellQuote(claude ? 'x-api-key: <YOUR_API_KEY>' : 'Authorization: Bearer <YOUR_API_KEY>')} \\`,
+    `  --header ${shellQuote('Content-Type: application/json')} \\`,
+    ...(claude ? [`  --header ${shellQuote('anthropic-version: 2023-06-01')} \\`] : []),
+    `  --header ${shellQuote('Accept: text/event-stream')} \\`,
+    `  --header ${shellQuote('User-Agent: deepseek-harness/<DSH_VERSION> (+https://github.com/deepseek-ai/deepseek-harness)')} \\`,
+    `  --data-raw ${shellQuote(JSON.stringify(body, null, 2))}`,
+  ].join('\n')
+}
+
+interface ParsedCurlConfig {
+  baseURL: string
+  apiType: 'chat' | 'responses' | 'messages'
+  model: string
+  apiKey?: string
+  maxTokens?: number
+}
+
+/** Tokenize the simple quoted curl form shown in the editor; never invokes a shell. */
+function tokenizeCurl(command: string): string[] {
+  const input = command.replace(/\\\r?\n/g, ' ')
+  const tokens: string[] = []
+  let token = ''
+  let started = false
+  let quote: "'" | '"' | undefined
+  for (let index = 0; index < input.length; index++) {
+    const char = input[index]!
+    if (quote === "'") {
+      if (char === "'") quote = undefined
+      else token += char
+      continue
+    }
+    if (quote === '"') {
+      if (char === '"') quote = undefined
+      else if (char === '\\' && index + 1 < input.length) token += input[++index]!
+      else token += char
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; started = true; continue }
+    if (char === '\\' && index + 1 < input.length) { token += input[++index]!; started = true; continue }
+    if (/[\s]/.test(char)) {
+      if (started) { tokens.push(token); token = ''; started = false }
+      continue
+    }
+    if (/[;|&<>`]/.test(char) || char === '$') throw new Error('curl 中不能包含 shell 运算符或变量展开。')
+    token += char
+    started = true
+  }
+  if (quote !== undefined) throw new Error('curl 中有未闭合的引号。')
+  if (started) tokens.push(token)
+  return tokens
+}
+
+/** Read only the supported curl URL, headers, and JSON body into gateway settings. */
+function parseCurlConfig(command: string): ParsedCurlConfig {
+  const args = tokenizeCurl(command)
+  if (args[0] !== 'curl' && args[0] !== 'curl.exe') throw new Error('命令必须以 curl 开头。')
+  let urlText: string | undefined
+  let bodyText: string | undefined
+  let method: string | undefined
+  const headers = new Map<string, string>()
+  const takeValue = (at: number, flag: string): string => {
+    const value = args[at + 1]
+    if (value === undefined) throw new Error(`${flag} 缺少参数。`)
+    return value
+  }
+  for (let at = 1; at < args.length; at++) {
+    const arg = args[at]!
+    if (arg === '--no-buffer' || arg === '-N' || arg === '--silent' || arg === '-s' || arg === '--show-error' || arg === '-S') continue
+    if (arg === '--request' || arg === '-X') { method = takeValue(at++, arg).toUpperCase(); continue }
+    if (arg === '--url') { urlText = takeValue(at++, arg); continue }
+    if (arg === '--header' || arg === '-H') {
+      const header = takeValue(at++, arg)
+      const colon = header.indexOf(':')
+      if (colon <= 0) throw new Error(`无法识别请求头：${header}`)
+      headers.set(header.slice(0, colon).trim().toLowerCase(), header.slice(colon + 1).trim())
+      continue
+    }
+    if (arg === '--data-raw' || arg === '--data' || arg === '-d') { bodyText = takeValue(at++, arg); continue }
+    if (arg.startsWith('--url=')) { urlText = arg.slice('--url='.length); continue }
+    if (arg.startsWith('http://') || arg.startsWith('https://')) { urlText = arg; continue }
+    if (arg.startsWith('-')) throw new Error(`不支持反向解析 curl 参数：${arg}`)
+    throw new Error(`无法识别 curl 参数：${arg}`)
+  }
+  if (method !== undefined && method !== 'POST') throw new Error('NewAPI 网关请求必须使用 POST。')
+  if (urlText === undefined || bodyText === undefined) throw new Error('curl 必须包含完整的请求 URL 和 JSON 请求体。')
+  let url: URL
+  let body: Record<string, unknown>
+  try { url = new URL(urlText) } catch { throw new Error('curl URL 必须是完整的 http(s) 地址。') }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('curl URL 只支持 http 或 https。')
+  if (url.search || url.hash) throw new Error('网关 URL 不能包含 query 或 hash。')
+  try {
+    const parsed: unknown = JSON.parse(bodyText)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error()
+    body = parsed as Record<string, unknown>
+  } catch { throw new Error('curl 请求体必须是 JSON 对象。') }
+
+  const path = url.pathname.replace(/\/+$/, '')
+  const route = path.endsWith('/chat/completions') ? 'chat'
+    : path.endsWith('/responses') ? 'responses'
+      : path.endsWith('/messages') ? 'messages' : undefined
+  if (route === undefined) throw new Error('URL 路径必须以 /chat/completions、/responses 或 /messages 结尾。')
+  const suffix = route === 'chat' ? '/chat/completions' : route === 'responses' ? '/responses' : '/messages'
+  const basePath = path.slice(0, -suffix.length).replace(/\/+$/, '')
+  if (basePath.length === 0) throw new Error('网关地址需要包含基础路径（通常以 /v1 结尾）。')
+  const model = body.model
+  if (typeof model !== 'string' || model.trim().length === 0) throw new Error('请求体必须包含 model。')
+  if (route === 'responses' && !Array.isArray(body.input)) throw new Error('Responses 请求体必须包含 input 数组。')
+  if (route !== 'responses' && !Array.isArray(body.messages)) throw new Error('Chat / Messages 请求体必须包含 messages 数组。')
+  let maxTokens: number | undefined
+  if (route === 'messages') {
+    const value = body.max_tokens
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw new Error('Claude Messages 请求体必须包含正整数 max_tokens。')
+    maxTokens = value
+  } else if (typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0) {
+    maxTokens = body.max_tokens
+  } else if (typeof body.max_output_tokens === 'number' && Number.isSafeInteger(body.max_output_tokens) && body.max_output_tokens > 0) {
+    maxTokens = body.max_output_tokens
+  }
+
+  const auth = headers.get('authorization')
+  const bearer = auth?.match(/^Bearer\s+(.+)$/i)?.[1]
+  const apiKey = headers.get('x-api-key') ?? bearer
+  const isPlaceholder = apiKey === undefined || /^<[^>]+>$/.test(apiKey) || /^\$[A-Za-z_][\w]*$/.test(apiKey)
+  return {
+    baseURL: `${url.origin}${basePath}`,
+    apiType: route,
+    model: model.trim(),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...!isPlaceholder ? { apiKey } : {},
+  }
 }
 
 /** Connection mode of a group: `newapi` (default) or `official-direct`. */
@@ -232,6 +381,9 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   const [params, setParams] = useState<ReadonlyMap<string, ModelsDevParamsResponse>>(new Map())
   const [paramChoices, setParamChoices] = useState<ReadonlyMap<string, ReadonlyMap<string, number>>>(new Map())
   const [paramsBusy, setParamsBusy] = useState(false)
+  const [curlOpen, setCurlOpen] = useState<ReadonlySet<number>>(new Set())
+  const [curlDrafts, setCurlDrafts] = useState<ReadonlyMap<number, string>>(new Map())
+  const [copiedCurl, setCopiedCurl] = useState<string | undefined>(undefined)
   const paramsRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     paramsRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
@@ -307,9 +459,9 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   }
 
   /** Refuse the save when a group or model row cannot be written. */
-  const catalogProblem = (): string | undefined => {
+  const catalogProblem = (sourceGroups = groups): string | undefined => {
     const seenGroups = new Set<string>()
-    for (const [gIndex, group] of groups.entries()) {
+    for (const [gIndex, group] of sourceGroups.entries()) {
       const gid = textOf(group, 'id').trim()
       if (gid.length === 0) return `${t('groupIdRequired')} (${t('groups')} ${String(gIndex + 1)})`
       if (seenGroups.has(gid)) return `${t('groupIdDuplicate')} (${gid})`
@@ -332,8 +484,8 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     return undefined
   }
 
-  const save = async (): Promise<void> => {
-    const problem = catalogProblem()
+  const save = async (sourceGroups = groups, sourceKeyDrafts = keyDrafts): Promise<void> => {
+    const problem = catalogProblem(sourceGroups)
     if (problem !== undefined) {
       setErrorText(problem)
       return
@@ -343,12 +495,13 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     setErrorText(undefined)
     try {
       const ops: SettingsPathOpView[] = []
-      const serializedGroups = groups.map(group => {
+      const serializedGroups = sourceGroups.map(group => {
         const id = textOf(group, 'id').trim()
         const name = textOf(group, 'name').trim()
         const baseURL = textOf(group, 'baseURL').trim()
         const mode = modeOf(group)
         const officialBaseURL = textOf(group, 'officialBaseURL').trim()
+        const maxTokens = numberOf(group, 'maxTokens')
         const proxy = proxies.get(id)
         const models = mode === 'official-direct' ? [] : modelsOf(group).map(model => {
           const mid = textOf(model, 'id').trim()
@@ -378,7 +531,8 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
           ...mode === 'official-direct' ? { mode: 'official-direct' as const } : {},
           ...mode === 'official-direct' && officialBaseURL.length > 0 ? { officialBaseURL } : {},
           ...baseURL.length > 0 && mode === 'newapi' ? { baseURL } : {},
-          ...apiTypeOf(group) === 'responses' && mode === 'newapi' ? { apiType: 'responses' as const } : {},
+          ...apiTypeOf(group) !== 'chat' && mode === 'newapi' ? { apiType: apiTypeOf(group) } : {},
+          ...maxTokens !== undefined && mode === 'newapi' ? { maxTokens } : {},
           models,
           ...mode === 'newapi' && proxy !== undefined ? {
             proxy: {
@@ -399,7 +553,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       }
       setRevision(mutated.value.revision)
       // Write each non-empty key draft to its group's credential ref.
-      for (const [ref, draft] of Object.entries(keyDrafts)) {
+      for (const [ref, draft] of Object.entries(sourceKeyDrafts)) {
         const key = draft.trim()
         if (key.length === 0) continue
         const stored = await api.credentials.set(ref, key)
@@ -409,11 +563,44 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         }
       }
       setKeyDrafts({})
+      setCurlDrafts(new Map())
       saved(t('saved'))
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /** Parse the edited curl into editable gateway settings, then persist them. */
+  const applyCurl = async (index: number, command: string): Promise<void> => {
+    setErrorText(undefined)
+    setNotice(undefined)
+    try {
+      const parsed = parseCurlConfig(command)
+      if (/^<[^>]+>$/.test(parsed.model)) throw new Error('请先将 <YOUR_MODEL_ID> 替换为真实模型 ID。')
+      const group = groups[index]
+      if (group === undefined) throw new Error('找不到要配置的网关。')
+      const id = textOf(group, 'id').trim()
+      if (id.length === 0) throw new Error(t('groupIdRequired'))
+      const existingModels = modelsOf(group)
+      const modelExists = existingModels.some(model => textOf(model, 'id') === parsed.model)
+      const nextGroup: GroupDraft = {
+        ...group,
+        baseURL: parsed.baseURL,
+        apiType: parsed.apiType,
+        ...(parsed.maxTokens !== undefined ? { maxTokens: parsed.maxTokens } : {}),
+        models: modelExists ? existingModels : [...existingModels, { id: parsed.model }],
+      }
+      const nextGroups = groups.map((entry, at) => at === index ? nextGroup : entry)
+      const nextKeys = parsed.apiKey === undefined
+        ? keyDrafts
+        : { ...keyDrafts, [groupCredRef(id)]: parsed.apiKey }
+      setGroups(nextGroups)
+      if (parsed.apiKey !== undefined) setKeyDrafts(nextKeys)
+      await save(nextGroups, nextKeys)
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -886,13 +1073,76 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                           </div>
 
                           <div className="newapi-field">
-                            <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
+                            <div className="newapi-curl-labelrow">
+                              <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
+                              <button
+                                type="button" className="newapi-linkbutton"
+                                aria-expanded={curlOpen.has(index)}
+                                onClick={() => setCurlOpen(current => {
+                                  const next = new Set(current)
+                                  if (next.has(index)) next.delete(index)
+                                  else next.add(index)
+                                  return next
+                                })}
+                              >
+                                {curlOpen.has(index) ? t('curlHide') : t('curlShow')}
+                              </button>
+                            </div>
                             <input
                               id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
                               value={textOf(group, 'baseURL')}
                               aria-label={`${t('baseUrl')} ${String(index + 1)}`}
-                              onChange={(event) => { patchGroup(index, { baseURL: event.target.value }) }}
+                              onChange={(event) => {
+                                patchGroup(index, { baseURL: event.target.value })
+                                setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
+                              }}
                             />
+                            {curlOpen.has(index)
+                              ? (() => {
+                                const generatedCurl = curlExample(
+                                  textOf(group, 'baseURL') || t('baseUrlPlaceholder'),
+                                  apiTypeOf(group),
+                                  textOf(modelsOf(group)[0] ?? {}, 'id') || '<YOUR_MODEL_ID>',
+                                )
+                                const curl = curlDrafts.get(index) ?? generatedCurl
+                                return (
+                                  <div className="newapi-curl-panel">
+                                    <div className="newapi-curl-toolbar">
+                                      <span className="newapi-hint">{t('curlHint')}</span>
+                                      <button
+                                        type="button" className="newapi-linkbutton"
+                                        onClick={() => {
+                                          void (async () => {
+                                            try {
+                                              await navigator.clipboard.writeText(curl)
+                                              setCopiedCurl(curl)
+                                            } catch {
+                                              setNotice(t('curlCopyFailed'))
+                                            }
+                                          })()
+                                        }}
+                                      >
+                                        {copiedCurl === curl ? t('curlCopied') : t('curlCopy')}
+                                      </button>
+                                    </div>
+                                    <textarea
+                                      className="newapi-curl-editor"
+                                      aria-label={t('curlEditor')}
+                                      spellCheck={false}
+                                      value={curl}
+                                      onChange={(event) => setCurlDrafts(current => new Map(current).set(index, event.target.value))}
+                                    />
+                                    <button
+                                      type="button" className="newapi-button newapi-button--primary"
+                                      disabled={busy || !writable}
+                                      onClick={() => { void applyCurl(index, curl) }}
+                                    >
+                                      {t('curlApply')}
+                                    </button>
+                                  </div>
+                                )
+                              })()
+                              : null}
                           </div>
 
                           <div className="newapi-field">
@@ -901,12 +1151,17 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                               id={`newapi-type-${index}`} className="newapi-select"
                               aria-label={`${t('apiType')} ${String(index + 1)}`}
                               value={apiTypeOf(group)}
-                              onChange={(event) => { patchGroup(index, { apiType: event.target.value }) }}
+                              onChange={(event) => {
+                                patchGroup(index, { apiType: event.target.value })
+                                setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
+                              }}
                             >
                               <option value="chat">{t('apiTypeChat')}</option>
                               <option value="responses">{t('apiTypeResponses')}</option>
+                              <option value="messages">{t('apiTypeMessages')}</option>
                             </select>
                             {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
+                            {apiTypeOf(group) === 'messages' ? <span className="newapi-hint">{t('apiTypeMessagesHint')}</span> : null}
                           </div>
 
                           <div className="newapi-proxyrow">

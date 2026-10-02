@@ -39,7 +39,7 @@ export interface GroupConfig {
      * `responses` serves the OpenAI Responses API (`POST {baseURL}/responses`,
      * for agents / multi-step output / tool calling).
      */
-    apiType?: 'chat' | 'responses';
+    apiType?: 'chat' | 'responses' | 'messages';
     /**
      * Wire mode: `newapi` (default) relays through the gateway;
      * `official-direct` delegates to the official DeepSeek adapter — requests

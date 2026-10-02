@@ -46,9 +46,11 @@ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { serializeRequest } from './serialize.ts'
 import { serializeResponsesRequest } from './serialize.ts'
+import { serializeMessagesRequest } from './serialize.ts'
 import { parseSse } from './sse.ts'
 import { translate } from './translate.ts'
 import { translateResponses } from './translate.ts'
+import { translateMessages } from './translate.ts'
 import type {
   ModelsDevApi,
   ModelsDevMatch,
@@ -123,9 +125,10 @@ export interface NewApiConnectionOptions {
    * Wire protocol for this group: `chat` (default) hits
    * `POST {baseURL}/chat/completions`; `responses` hits
    * `POST {baseURL}/responses` (the OpenAI Responses API shape, for agents /
-   * multi-step output / tool calling).
+   * multi-step output / tool calling); `messages` hits the Anthropic Messages
+   * API at `POST {baseURL}/messages`.
    */
-  apiType?: 'chat' | 'responses'
+  apiType?: 'chat' | 'responses' | 'messages'
   /** Gateway base including the `/v1` prefix; `/chat/completions`, `/responses`, and `/models` are appended. */
   baseURL: string
   /**
@@ -935,15 +938,19 @@ export class NewApiAdapter extends LlmAdapter {
     // resolve them to data URLs so the serializer can emit OpenAI content
     // parts. Text-only rows and an absent resolver keep the text-only wire.
     const images = await this.resolveRequestImages(options, signal, connection)
-    const responses = connection.apiType === 'responses'
-    const body = responses
+    const apiType = connection.apiType ?? 'chat'
+    const body = apiType === 'responses'
       ? serializeResponsesRequest(options, images)
-      : serializeRequest(options, images)
+      : apiType === 'messages'
+        ? serializeMessagesRequest(options, connection.maxTokens, images)
+        : serializeRequest(options, images)
     // Prepared outside the try so the TRANSPORT label below covers exactly the
     // transport boundary, never a serialization failure.
     const payload = JSON.stringify(body)
     const headers = {
-      'authorization': `Bearer ${apiKey}`,
+      ...(apiType === 'messages'
+        ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+        : { 'authorization': `Bearer ${apiKey}` }),
       'content-type': 'application/json',
       'accept': 'text/event-stream',
       // The mandatory product attribution; nothing per-request or per-user
@@ -953,7 +960,8 @@ export class NewApiAdapter extends LlmAdapter {
 
     let response: Response
     try {
-      response = await fetch(`${connection.baseURL}${responses ? '/responses' : '/chat/completions'}`, {
+      const endpoint = `${connection.baseURL}${apiType === 'responses' ? '/responses' : apiType === 'messages' ? '/messages' : '/chat/completions'}`
+      response = await fetch(endpoint, {
         method: 'POST',
         headers,
         body: payload,
@@ -996,8 +1004,10 @@ export class NewApiAdapter extends LlmAdapter {
       throw new LlmError('NewAPI returned no response body', 'EMPTY_RESPONSE')
     }
 
-    yield* responses
+    yield* apiType === 'responses'
       ? translateResponses(parseSse(response.body, onComment, false))
-      : translate(parseSse(response.body, onComment))
+      : apiType === 'messages'
+        ? translateMessages(parseSse(response.body, onComment, false))
+        : translate(parseSse(response.body, onComment))
   }
 }

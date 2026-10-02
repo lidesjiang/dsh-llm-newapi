@@ -14,6 +14,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { isVolatile } from '@deepseek-ai/cosmokit'
 import {
   assertUsableApiKey,
   LlmError,
@@ -29,6 +30,7 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 import type { AnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 import { DeepSeekAdapter, resolveAdapterOptions as resolveOfficialOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import type { DeepSeekCatalogModel } from '@deepseek-ai/dsh-llm-deepseek'
 // Type-only: pulls the cordis Context augmentation declaring ctx.settings
 // (SettingsProvider), which the removed installSettingsSection import used
 // to load transitively (0.1.2 migration).
@@ -147,7 +149,7 @@ export interface GroupConfig {
    * `responses` serves the OpenAI Responses API (`POST {baseURL}/responses`,
    * for agents / multi-step output / tool calling).
    */
-  apiType?: 'chat' | 'responses'
+  apiType?: 'chat' | 'responses' | 'messages'
   /**
    * Wire mode: `newapi` (default) relays through the gateway;
    * `official-direct` delegates to the official DeepSeek adapter — requests
@@ -234,7 +236,7 @@ const proxySchema: z<ProxyConfig> = z.object({
 const groupSchema: z<GroupConfig> = z.object({
   id: z.string().required(),
   name: z.string(),
-  apiType: z.union(['chat', 'responses']),
+  apiType: z.union(['chat', 'responses', 'messages']),
   mode: z.union(['newapi', 'official-direct']),
   // No default: the official endpoint needs no /v1 prefix and resolveGroupOptions
   // falls back to DEFAULT_OFFICIAL_BASE_URL for official-direct groups.
@@ -256,25 +258,25 @@ const groupSchema: z<GroupConfig> = z.object({
   retryPolicy: RetryPolicySchema,
 })
 
-export const Config: z<Config> = z.object({
-  groups: z.array(groupSchema).default([]),
+export const Config = z.object({
+  groups: z.array(groupSchema).default([]).volatile(),
   // Legacy flat fields: accepted when groups is absent.
-  mode: z.union(['newapi', 'official-direct']),
-  officialBaseURL: z.string(),
-  officialApiKeyRef: z.string(),
-  baseURL: z.string(),
-  models: z.array(catalogModel).default([]),
-  modelExcludePatterns: z.array(z.string()).default([...DEFAULT_MODEL_EXCLUDE_PATTERNS]),
-  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
-  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
-  proxy: proxySchema.default({ enabled: false, url: DEFAULT_PROXY_URL }),
+  mode: z.union(['newapi', 'official-direct']).volatile(),
+  officialBaseURL: z.string().volatile(),
+  officialApiKeyRef: z.string().volatile(),
+  baseURL: z.string().volatile(),
+  models: z.array(catalogModel).default([]).volatile(),
+  modelExcludePatterns: z.array(z.string()).default([...DEFAULT_MODEL_EXCLUDE_PATTERNS]).volatile(),
+  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW).volatile(),
+  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).volatile(),
+  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS).volatile(),
+  proxy: proxySchema.default({ enabled: false, url: DEFAULT_PROXY_URL }).volatile(),
   providerHints: z.object({
     defaults: z.object({}),
     models: z.object({}),
   }),
   retryPolicy: RetryPolicySchema,
-})
+}) as unknown as z<Config>
 
 export type ResolvedNewApiOptions = NewApiConnectionOptions
 
@@ -322,6 +324,34 @@ function resolveModels(models: readonly NewApiCatalogModel[] | undefined): NewAp
       ...model.vision === true ? { vision: true } : {},
     }
   })
+}
+
+/**
+ * Map this plugin's gateway catalog rows onto the official adapter's catalog
+ * shape. An official-direct group reuses the official adapter for transport,
+ * so a group that declares its own models must hand them over in the official
+ * shape: `vision: true` becomes `['text', 'image']`, and the image bounds stay
+ * unset so the official resolver applies its own defaults. That last part is
+ * load-bearing — the official resolver rejects a text-only row that carries
+ * image request limits ("cannot declare image request limits"), so the bounds
+ * must never be copied onto a row whose modalities do not include `image`.
+ * @param models - the group's already-resolved catalog rows.
+ * @returns the official-shaped catalog, or `undefined` when the group declares
+ *   no models of its own (the caller then leaves the official built-in
+ *   catalog in force instead of overriding it with an empty list).
+ */
+function officialCatalogOf(
+  models: readonly NewApiCatalogModel[],
+): DeepSeekCatalogModel[] | undefined {
+  if (models.length === 0) return undefined
+  return models.map(model => ({
+    id: model.id,
+    ...model.name === undefined ? {} : { name: model.name },
+    ...model.description === undefined ? {} : { description: model.description },
+    ...model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow },
+    ...model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens },
+    ...model.vision === true ? { inputModalities: ['text', 'image'] as const } : {},
+  }))
 }
 
 // ─── Group resolution ──────────────────────────────────────────────────────
@@ -415,7 +445,7 @@ export function resolveGroupOptions(
   return {
     provider: route,
     displayName: group.name ?? group.id,
-    apiType: group.apiType === 'responses' ? 'responses' : 'chat',
+    apiType: group.apiType === 'responses' || group.apiType === 'messages' ? group.apiType : 'chat',
     mode,
     ...mode === 'newapi'
       ? { baseURL: normalizeBaseUrl(rawBase) }
@@ -463,7 +493,10 @@ export function resolveAdapterOptions(config: Config, environment?: ReturnType<t
 // ─── Plugin apply ──────────────────────────────────────────────────────────
 
 export function apply(ctx: Context, config: Config): void {
-  let current: () => Config = () => config
+  const unwrapConfig = (value: Config): Config => Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, isVolatile(entry) ? entry.get() : entry]),
+  ) as Config
+  let current: () => Config = () => unwrapConfig(config)
   // Cached group resolutions: route → options.
   let lastConfig: Config | undefined
   let lastGroups: NewApiConnectionOptions[] | undefined
@@ -536,16 +569,18 @@ export function apply(ctx: Context, config: Config): void {
    * hit the official API and carry its expected telemetry headers.
    */
   const createOfficialAdapter = (connection: NewApiConnectionOptions): OfficialAdapterDelegate => {
+    // A group that declares its own catalog overrides the official built-in
+    // one; a group with no models of its own (the common case, and every
+    // route pointed at the real DeepSeek endpoint) keeps the official list.
+    // Passing an empty array would do the opposite — the official resolver
+    // treats `models: []` as an authoritative empty catalog, not as "unset" —
+    // so the field is omitted entirely instead.
+    const models = officialCatalogOf(connection.models)
     const official = resolveOfficialOptions({
-      // The official resolver re-validates and normalizes the endpoint; the
-      // credential reference rides as the official apiKeyEnv (resolved per
-      // request through the credentials seam below, never from the process
-      // environment). Only raw retry-policy config is accepted here (the
-      // group's already-resolved policy cannot round-trip), so the official
-      // default policy applies — the same normal-mode default the gateway
-      // side resolves from an unset config.
+      // The 0.2 DeepSeek adapter speaks the Messages API. Credentials stay out
+      // of its connection snapshot and are resolved per request below.
       ...(connection.officialBaseURL !== undefined ? { baseURL: connection.officialBaseURL } : {}),
-      ...connection.officialApiKeyRef !== undefined ? { apiKeyEnv: connection.officialApiKeyRef } : {},
+      ...models === undefined ? {} : { models },
       streamIdleTimeoutMs: connection.streamIdleTimeoutMs,
     })
     const resolveOfficialApiKey = async (): Promise<string> => {
@@ -570,7 +605,7 @@ export function apply(ctx: Context, config: Config): void {
     let userId: AnonymousUserId | undefined
     return new DeepSeekAdapter({
       options: () => official,
-      resolveApiKey: resolveOfficialApiKey,
+      resolveAuth: async () => ({ headers: { Authorization: `Bearer ${await resolveOfficialApiKey()}` } }),
       resolveUserId: () => userId ??= getOrCreateAnonymousUserId(),
       // Image support rides the durable attachment service when mounted —
       // the official adapter's vision path (Files API with base64 fallback)
@@ -693,24 +728,12 @@ export function apply(ctx: Context, config: Config): void {
     ), 'llm-newapi: models-dev RPC channel')
   })
 
-  // Initial sync + settings section.
+  // Initial sync + settings form policy. Config fields marked volatile above
+  // are writable through SettingsForms and remain backed by live config.
   syncProviders()
 
-  // The settings section installs once the settings service mounts: the
-  // section lives on the user-settings seam (SettingsProvider.installSection,
-  // 0.1.2) instead of the removed installSettingsSection helper. The owner
-  // context is this plugin's own ctx — separate lifecycle from the settings
-  // service context.
+  // This plugin owns a custom settings UI, so disable automatic form rendering.
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      validate: (value) => {
-        const groups = expandGroups(value, launchEnvironmentOf(ctx))
-        for (const g of groups) resolveGroupOptions(g, launchEnvironmentOf(ctx))
-      },
-      setSource: (source) => {
-        current = source
-      },
-      onChange: syncProviders,
-    })
+    ctx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
   })
 }

@@ -81,9 +81,10 @@ export interface NewApiConnectionOptions {
      * Wire protocol for this group: `chat` (default) hits
      * `POST {baseURL}/chat/completions`; `responses` hits
      * `POST {baseURL}/responses` (the OpenAI Responses API shape, for agents /
-     * multi-step output / tool calling).
+     * multi-step output / tool calling); `messages` hits the Anthropic Messages
+     * API at `POST {baseURL}/messages`.
      */
-    apiType?: 'chat' | 'responses';
+    apiType?: 'chat' | 'responses' | 'messages';
     /** Gateway base including the `/v1` prefix; `/chat/completions`, `/responses`, and `/models` are appended. */
     baseURL: string;
     /**

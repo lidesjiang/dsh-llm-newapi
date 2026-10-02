@@ -610,7 +610,9 @@ function stubModelsListing() {
 // riding as the official thinking/reasoning_effort fields, and the model
 // catalog served from the official adapter's built-in list. The gateway
 // fields of the group are inert in this mode (a half-typed gateway base URL
-// must not gate a mode that never uses it).
+// must not gate a mode that never uses it). A group that declares no models
+// of its own keeps that built-in list, which is what a route pointed at the
+// real DeepSeek endpoint wants.
 {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -621,15 +623,14 @@ function stubModelsListing() {
     mode: 'official-direct',
     // Inert in official-direct mode: invalid as a gateway base, never used.
     baseURL: 'not-a-gateway-url',
-    models: [{ id: 'stale-gateway-model' }],
   }] })
 
-  // listModels serves the official built-in catalog, not the group's stale
-  // gateway models.
+  // With no catalog of its own, the group serves the official built-in
+  // catalog, so the official models and their capacities stay available.
   const listed = await ctx.llm.listModels('newapi')
   const listedIds = listed.map(model => model.id)
   assert.ok(listedIds.includes('deepseek-v4-flash'), 'official catalog includes deepseek-v4-flash')
-  assert.ok(!listedIds.includes('stale-gateway-model'), 'gateway catalog is inert in official-direct mode')
+  assert.ok(listedIds.includes('deepseek-v4-pro'), 'official catalog includes deepseek-v4-pro')
 
   // resolveModel carries the official context window and the official
   // reasoning-effort selector (off/low/high/max), not models.dev facts.
@@ -711,6 +712,45 @@ function stubModelsListing() {
   assert.equal(missing.reason.failure.code, 'MISSING_CREDENTIAL')
   assert.ok(missing.reason.failure.message.includes('official-direct mode'))
   assert.ok(missing.reason.failure.message.includes('deepseek_official'))
+}
+
+// ── Block J2: an official-direct group may override the official catalog ──
+// Serving a gateway that renames the official models (an endpoint that
+// accepts `deepseek-v4.1-flash` but answers 503 for the official id) needs
+// the group's own catalog to reach the model selector, otherwise the
+// selector advertises ids that endpoint rejects. Declaring models therefore
+// overrides the official built-in list, while the official context window
+// and reasoning-effort selector still come from the official adapter.
+{
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(FakeCredentials, { deepseek_official_Ginka: 'gateway-official-key' })
+  await mountPlugin(ctx, { groups: [{
+    id: 'Ginka',
+    name: 'Ginka-DA',
+    mode: 'official-direct',
+    officialBaseURL: 'https://api.ginka.cloud/v1',
+    models: [
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_000_000, maxTokens: 384_000, vision: true },
+    ],
+  }] })
+
+  // The declared catalog wins, and the official built-ins it omits are gone.
+  const listedIds = (await ctx.llm.listModels('newapi-Ginka')).map(model => model.id)
+  assert.deepEqual(listedIds, ['deepseek-v4.1-flash'], 'declared catalog replaces the official built-ins')
+
+  // `vision: true` reaches the harness as the image modality, which is what
+  // lets the serializer keep image content for this model.
+  const resolved = await ctx.llm.resolveModelInfo('newapi-Ginka', 'deepseek-v4.1-flash')
+  assert.equal(resolved.context.contextWindow, 1_000_000)
+  assert.equal(resolved.defaultMaxTokens, 384_000)
+  assert.ok(resolved.inputModalities.includes('image'), 'declared vision row accepts image input')
+  // The official adapter still owns the reasoning selector in this mode.
+  assert.deepEqual(resolved.reasoning.efforts.map(effort => effort.id), ['off', 'low', 'high', 'max'])
+
+  // Discovery answers the declared catalog offline, as before.
+  const discovered = await ctx.llm.discoverModels('llm-newapi', { provider: 'newapi-Ginka' })
+  assert.deepEqual(discovered.map(model => model.id), ['deepseek-v4.1-flash'])
 }
 
 // ── Block K: official-direct settings validation and newapi regression ──

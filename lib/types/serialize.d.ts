@@ -12,18 +12,16 @@
  * `reasoning_effort`).
  * @module dsh-llm-newapi/serialize
  */
-import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm';
 import type { ResponsesRequest, WireMessage, WireRequest } from './types.js';
 /**
- * Serialize the conversation. `tool-result` blocks become standalone
- * `{role: 'tool'}` messages; the harness puts each tool result in its own
- * user-role message, so a mixed user message contributes its text first and
- * its tool results as separate wire messages after.
+ * Serialize the conversation. DSH tool-role messages become standalone
+ * `{role: 'tool'}` messages, matching the gateway chat-completions format.
  * @param messages - the harness conversation, in order.
  * @param images - resolved attachmentId → data URL (vision models only).
  * @returns the wire messages; order preserved, each tool result expanded into its own entry.
  */
-export declare function serializeMessages(messages: Message[], images?: ReadonlyMap<string, string>): WireMessage[];
+export declare function serializeMessages(messages: readonly RequestMessage[], images?: ReadonlyMap<string, string>): WireMessage[];
 /**
  * Build the full wire request. Always streaming (`stream: true`, usage
  * reporting on); optional fields are omitted rather than sent as null, so
@@ -36,6 +34,8 @@ export declare function serializeMessages(messages: Message[], images?: Readonly
  * @returns the chat-completions request body.
  */
 export declare function serializeRequest(options: GenerateOptions, images?: ReadonlyMap<string, string>): WireRequest;
+/** Serialize DSH messages and tools to Anthropic's Messages API schema. */
+export declare function serializeMessagesRequest(options: GenerateOptions, defaultMaxTokens?: number, images?: ReadonlyMap<string, string>): Record<string, unknown>;
 /**
  * Build the wire request for the Responses API endpoint. The RPC shape maps
  * harness concepts to the `input` array (role messages + function_call /

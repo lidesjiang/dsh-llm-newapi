@@ -14,7 +14,7 @@
  */
 
 import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, GenerateOptions, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type {
   ResponsesContentPart,
   ResponsesInputItem,
@@ -26,8 +26,8 @@ import type {
   WireTool,
 } from './types.ts'
 
-/** Join the text blocks of a message (used for user/tool-result content). */
-function flattenText(blocks: ContentBlock[]): string {
+/** Join the text blocks of a message. */
+function flattenText(blocks: readonly ContentBlock[]): string {
   return blocks
     .filter(block => block.type === 'text')
     .map(block => block.text)
@@ -93,7 +93,7 @@ function serializeAssistant(message: Message): WireMessage {
  * @param images - resolved attachmentId → data URL, or `undefined` text-only.
  * @returns the wire content value.
  */
-function serializeUserContent(message: Message, images?: ReadonlyMap<string, string>): string | WireContentPart[] {
+function serializeUserContent(message: Pick<Message, 'content'> | { readonly content: readonly ContentBlock[] }, images?: ReadonlyMap<string, string>): string | WireContentPart[] {
   if (images !== undefined && contentHasImage(message.content)) {
     const parts: WireContentPart[] = []
     for (const block of message.content) {
@@ -110,15 +110,13 @@ function serializeUserContent(message: Message, images?: ReadonlyMap<string, str
 }
 
 /**
- * Serialize the conversation. `tool-result` blocks become standalone
- * `{role: 'tool'}` messages; the harness puts each tool result in its own
- * user-role message, so a mixed user message contributes its text first and
- * its tool results as separate wire messages after.
+ * Serialize the conversation. DSH tool-role messages become standalone
+ * `{role: 'tool'}` messages, matching the gateway chat-completions format.
  * @param messages - the harness conversation, in order.
  * @param images - resolved attachmentId → data URL (vision models only).
  * @returns the wire messages; order preserved, each tool result expanded into its own entry.
  */
-export function serializeMessages(messages: Message[], images?: ReadonlyMap<string, string>): WireMessage[] {
+export function serializeMessages(messages: readonly RequestMessage[], images?: ReadonlyMap<string, string>): WireMessage[] {
   const wire: WireMessage[] = []
   for (const message of messages) {
     if (message.role === 'system') {
@@ -131,22 +129,26 @@ export function serializeMessages(messages: Message[], images?: ReadonlyMap<stri
       wire.push(serializeAssistant(message))
       continue
     }
-    // user role: tool results ride in user messages in the harness
-    // vocabulary, but the gateway wants them as role:'tool' messages.
-    const toolResults = message.content.filter(block => block.type === 'tool-result')
-    const content = serializeUserContent(message, images)
-    const text = typeof content === 'string' ? content : flattenText(message.content)
-    if (text.length > 0 || toolResults.length === 0) {
-      wire.push({ role: 'user', content })
-    }
-    for (const result of toolResults) {
+    if (message.role === 'tool') {
+      assertTextOnly(message.content)
       wire.push({
         role: 'tool',
-        tool_call_id: result.toolCallId,
-        // Empty tool output still needs SOME content on the wire.
-        content: flattenText(result.content) || '(no output)',
+        tool_call_id: message.toolCallId,
+        content: flattenText(message.content) || '(no output)',
       })
+      continue
     }
+    // DSH 0.2 persists dynamic tool updates as developer messages. The active
+    // tool list is sent on each gateway request, so only any accompanying text
+    // needs to be preserved as developer context.
+    if (message.role === 'developer') {
+      assertTextOnly(message.content)
+      const text = flattenText(message.content)
+      if (text.length > 0) wire.push({ role: 'system', content: text })
+      continue
+    }
+    const content = serializeUserContent(message, images)
+    wire.push({ role: 'user', content })
   }
   return wire
 }
@@ -188,6 +190,103 @@ export function serializeRequest(options: GenerateOptions, images?: ReadonlyMap<
     ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
     ...options.reasoningEffort !== undefined ? { reasoning_effort: options.reasoningEffort } : {},
     ...options.stop !== undefined ? { stop: options.stop } : {},
+  }
+}
+
+type MessagesContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+
+/** Convert a resolved data URL to the Anthropic base64 image source form. */
+function messagesImagePart(dataUrl: string): MessagesContentBlock {
+  const match = /^data:(image\/[\w.+-]+);base64,([\s\S]+)$/.exec(dataUrl)
+  if (match === null) throw new LlmError('Resolved image data is not a base64 image data URL.', 'UNSUPPORTED_CONTENT')
+  return { type: 'image', source: { type: 'base64', media_type: match[1]!, data: match[2]! } }
+}
+
+/** Serialize DSH messages and tools to Anthropic's Messages API schema. */
+export function serializeMessagesRequest(
+  options: GenerateOptions,
+  defaultMaxTokens?: number,
+  images?: ReadonlyMap<string, string>,
+): Record<string, unknown> {
+  const system: string[] = options.system === undefined ? [] : [options.system]
+  const messages: Array<{ role: 'user' | 'assistant'; content: string | MessagesContentBlock[] }> = []
+
+  for (const message of options.messages) {
+    if (message.role === 'system' || message.role === 'developer') {
+      assertTextOnly(message.content)
+      const text = flattenText(message.content)
+      if (text.length > 0) system.push(text)
+      continue
+    }
+    if (message.role === 'tool') {
+      assertTextOnly(message.content)
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: message.toolCallId,
+          content: flattenText(message.content) || '(no output)',
+          ...(message.isError === true ? { is_error: true } : {}),
+        }],
+      })
+      continue
+    }
+    if (message.role === 'assistant') {
+      assertTextOnly(message.content)
+      const content: MessagesContentBlock[] = []
+      for (const block of message.content) {
+        if (block.type === 'text') {
+          content.push({ type: 'text', text: block.text })
+          continue
+        }
+        if (block.type !== 'tool-call') continue
+        let input: unknown
+        try { input = JSON.parse(block.arguments) } catch (cause) {
+          throw new LlmError('Assistant tool arguments are not valid JSON.', 'MALFORMED_REQUEST', { cause })
+        }
+        if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+          throw new LlmError('Anthropic tool input must be a JSON object.', 'MALFORMED_REQUEST')
+        }
+        content.push({ type: 'tool_use', id: block.id, name: block.name, input: input as Record<string, unknown> })
+      }
+      if (content.length > 0) messages.push({ role: 'assistant', content })
+      continue
+    }
+
+    if (images !== undefined && contentHasImage(message.content)) {
+      const content: MessagesContentBlock[] = []
+      for (const block of message.content) {
+        if (block.type === 'text') content.push({ type: 'text', text: block.text })
+        if (block.type === 'image') {
+          const dataUrl = images.get(block.attachment.attachmentId)
+          if (dataUrl !== undefined) content.push(messagesImagePart(dataUrl))
+        }
+      }
+      messages.push({ role: 'user', content })
+    } else {
+      assertTextOnly(message.content)
+      messages.push({ role: 'user', content: flattenText(message.content) })
+    }
+  }
+
+  const tools = options.tools?.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    input_schema: tool.parameters,
+  }))
+  return {
+    model: options.model,
+    max_tokens: options.maxTokens ?? defaultMaxTokens ?? 4096,
+    messages,
+    stream: true,
+    ...(system.length > 0 ? { system: system.join('\n\n') } : {}),
+    ...(tools !== undefined && tools.length > 0 ? { tools } : {}),
+    ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+    ...(options.stop !== undefined ? { stop_sequences: options.stop } : {}),
   }
 }
 
@@ -245,8 +344,24 @@ export function serializeResponsesRequest(
       continue
     }
 
-    // user-role messages: text + optional images + tool results.
-    const toolResults = message.content.filter(block => block.type === 'tool-result')
+    if (message.role === 'tool') {
+      assertTextOnly(message.content)
+      input.push({
+        type: 'function_call_output',
+        call_id: message.toolCallId,
+        output: flattenText(message.content) || '(no output)',
+      })
+      continue
+    }
+
+    if (message.role === 'developer') {
+      assertTextOnly(message.content)
+      const text = flattenText(message.content)
+      if (text.length > 0) input.push({ role: 'system', content: text })
+      continue
+    }
+
+    // User-role messages: text and optional resolved images.
     const content = serializeUserContent(message, images)
     const text = typeof content === 'string' ? content : flattenText(message.content)
     const parts = Array.isArray(content) ? toResponsesContent(content) : undefined
@@ -254,13 +369,6 @@ export function serializeResponsesRequest(
       input.push({
         role: 'user',
         content: parts !== undefined && parts.some(p => p.type === 'input_image') ? parts : text,
-      })
-    }
-    for (const result of toolResults) {
-      input.push({
-        type: 'function_call_output',
-        call_id: result.toolCallId,
-        output: flattenText(result.content) || '(no output)',
       })
     }
   }

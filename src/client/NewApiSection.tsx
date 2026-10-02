@@ -152,17 +152,6 @@ function groupCredRef(id: string): string {
   return id === 'newapi' ? 'newapi' : `newapi_${safe}`
 }
 
-/**
- * Derived credential ref for a group's official-direct API key (mirrors the
- * host's groupOfficialCredRef): the `deepseek_official` prefix never collides
- * with a gateway ref nor the official plugin's DEEPSEEK_API_KEY reference, so
- * each group keeps one key per mode.
- */
-function groupOfficialCredRef(id: string): string {
-  const safe = id.replace(/[^A-Za-z0-9_]/g, '_')
-  return id === 'newapi' ? 'deepseek_official' : `deepseek_official_${safe}`
-}
-
 /** Wire protocol of a group: `chat` (default) or `responses`. */
 function apiTypeOf(group: GroupDraft): 'chat' | 'responses' | 'messages' {
   const apiType = textOf(group, 'apiType')
@@ -317,11 +306,6 @@ function parseCurlConfig(command: string): ParsedCurlConfig {
   }
 }
 
-/** Connection mode of a group: `newapi` (default) or `official-direct`. */
-function modeOf(group: GroupDraft): 'newapi' | 'official-direct' {
-  return textOf(group, 'mode') === 'official-direct' ? 'official-direct' : 'newapi'
-}
-
 /** Convert a stored section value into editable group drafts without dropping fields. */
 function toGroupDrafts(source: unknown): GroupDraft[] {
   if (Array.isArray(source)) {
@@ -418,14 +402,10 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         : [{ id: 'newapi', ...(typeof value.baseURL === 'string' ? { baseURL: value.baseURL } : {}), ...(Array.isArray(value.models) ? { models: value.models } : {}) }]
       const drafts = toGroupDrafts(storedGroups)
       setGroups(drafts)
-      // Credential facts for every group ref — the gateway ref of every group
-      // plus the official ref of each official-direct group.
-      const refs = [...new Set(drafts.flatMap(group => {
-        const gid = textOf(group, 'id') || 'newapi'
-        return modeOf(group) === 'official-direct'
-          ? [groupCredRef(gid), groupOfficialCredRef(gid)]
-          : [groupCredRef(gid)]
-      }))]
+      if (drafts.some(group => textOf(group, 'mode') === 'official-direct')) {
+        setNotice(t('removedModeNotice'))
+      }
+      const refs = [...new Set(drafts.map(group => groupCredRef(textOf(group, 'id') || 'newapi')))]
       const credential = await api.credentials.describe(refs)
       if (credential.ok) {
         const byRef: Record<string, { configured: boolean; locked: boolean }> = {}
@@ -440,7 +420,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       }
       // Groups start collapsed: with several gateways an expanded-by-default
       // page is a wall of forms. The chevron opens one on demand.
-      setExpandedGroups(new Set())
+      setExpandedGroups(drafts.length === 1 ? new Set([textOf(drafts[0] ?? {}, 'id')]) : new Set())
       setExpandedModels(new Map())
       setEditing(new Map())
       setKeyDrafts({})
@@ -499,11 +479,9 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         const id = textOf(group, 'id').trim()
         const name = textOf(group, 'name').trim()
         const baseURL = textOf(group, 'baseURL').trim()
-        const mode = modeOf(group)
-        const officialBaseURL = textOf(group, 'officialBaseURL').trim()
         const maxTokens = numberOf(group, 'maxTokens')
         const proxy = proxies.get(id)
-        const models = mode === 'official-direct' ? [] : modelsOf(group).map(model => {
+        const models = modelsOf(group).map(model => {
           const mid = textOf(model, 'id').trim()
           const mname = textOf(model, 'name').trim()
           const contextWindow = numberOf(model, 'contextWindow')
@@ -528,13 +506,11 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         return {
           id,
           ...name.length > 0 ? { name } : {},
-          ...mode === 'official-direct' ? { mode: 'official-direct' as const } : {},
-          ...mode === 'official-direct' && officialBaseURL.length > 0 ? { officialBaseURL } : {},
-          ...baseURL.length > 0 && mode === 'newapi' ? { baseURL } : {},
-          ...apiTypeOf(group) !== 'chat' && mode === 'newapi' ? { apiType: apiTypeOf(group) } : {},
-          ...maxTokens !== undefined && mode === 'newapi' ? { maxTokens } : {},
+          ...baseURL.length > 0 ? { baseURL } : {},
+          ...apiTypeOf(group) !== 'chat' ? { apiType: apiTypeOf(group) } : {},
+          ...maxTokens !== undefined ? { maxTokens } : {},
           models,
-          ...mode === 'newapi' && proxy !== undefined ? {
+          ...proxy !== undefined ? {
             proxy: {
               enabled: proxy.enabled,
               url: proxy.url.trim().length > 0 ? proxy.url.trim() : DEFAULT_PROXY_URL,
@@ -937,19 +913,13 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         {groups.length === 0 ? <p className="newapi-empty">{t('noGroups')}</p> : null}
         {groups.map((group, index) => {
           const gid = textOf(group, 'id').trim()
-          const mode = modeOf(group)
           const ref = groupCredRef(gid.length > 0 ? gid : 'newapi')
           const cred = credentials[ref]
-          // Official-direct facts: the group's official credential ref, its
-          // stored/locked state, and the write-only key draft buffer.
-          const officialRef = groupOfficialCredRef(gid.length > 0 ? gid : 'newapi')
-          const officialCred = mode === 'official-direct' ? credentials[officialRef] : undefined
-          const officialKeyDraft = mode === 'official-direct' ? keyDrafts[officialRef] ?? '' : ''
           const expanded = expandedGroups.has(gid)
-          const groupModels = mode === 'official-direct' ? [] : modelsOf(group)
+          const groupModels = modelsOf(group)
           const groupProxy = proxies.get(gid) ?? { enabled: false, url: DEFAULT_PROXY_URL }
-          const groupParams = mode === 'official-direct' ? undefined : params.get(gid)
-          const groupCandidates = mode === 'official-direct' ? undefined : candidates.get(gid)
+          const groupParams = params.get(gid)
+          const groupCandidates = candidates.get(gid)
           const keyDraft = keyDrafts[ref] ?? ''
           const groupFilter = filters.get(gid) ?? ''
           const visible = (groupCandidates ?? []).filter(model => matchesFilter(model, groupFilter))
@@ -967,22 +937,14 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                 >
                   <IconChevron open={expanded} />
                 </button>
-                <input
-                  className="newapi-input newapi-group-name" type="text"
-                  placeholder={t('groupNamePlaceholder')} value={textOf(group, 'name')}
-                  aria-label={`${t('groupName')} ${String(index + 1)}`}
-                  onChange={(event) => { patchGroup(index, { name: event.target.value }) }}
-                />
+                <span className="newapi-group-name">{textOf(group, 'name') || t('groupNamePlaceholder')}</span>
                 <span className="newapi-badge" title={t('groupRoute')}>{groupRoute(gid)}</span>
-                {mode === 'official-direct'
-                  ? <span className="newapi-badge" title={t('modeOfficialHint')}>{t('officialBadge')}</span>
-                  : null}
-                {mode === 'newapi' && apiTypeOf(group) === 'responses' ? <span className="newapi-badge" title={t('apiTypeResponsesHint')}>{t('apiTypeResponses')}</span> : null}
+                {apiTypeOf(group) !== 'chat' ? <span className="newapi-badge" title={apiTypeOf(group) === 'messages' ? t('apiTypeMessagesHint') : t('apiTypeResponsesHint')}>{apiTypeOf(group) === 'messages' ? t('apiTypeMessages') : t('apiTypeResponses')}</span> : null}
                 <span
-                  className={`newapi-statusdot ${(mode === 'official-direct' ? officialCred?.configured === true : cred?.configured === true) ? 'newapi-statusdot--ok' : 'newapi-statusdot--warn'}`}
-                  title={(mode === 'official-direct' ? officialCred?.configured === true : cred?.configured === true) ? t('keyStored') : t('keyMissing')}
+                  className={`newapi-statusdot ${cred?.configured === true ? 'newapi-statusdot--ok' : 'newapi-statusdot--warn'}`}
+                  title={cred?.configured === true ? t('keyStored') : t('keyMissing')}
                 />
-                <span className="newapi-count">{mode === 'official-direct' ? t('officialBadge') : `${String(groupModels.length)} ${t('models')}`}</span>
+                <span className="newapi-count">{`${String(groupModels.length)} ${t('models')}`}</span>
                 <button
                   type="button" className="newapi-iconbutton newapi-iconbutton--danger"
                   aria-label={`${t('removeGroup')} ${String(index + 1)}`}
@@ -1008,186 +970,132 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                           remapGroupId(oldId, event.target.value)
                         }}
                       />
+                      <span className="newapi-hint">{t('groupIdHint')}</span>
                     </div>
-
                     <div className="newapi-field">
-                      <label htmlFor={`newapi-mode-${index}`}>{t('mode')}</label>
-                      <select
-                        id={`newapi-mode-${index}`} className="newapi-select"
-                        aria-label={`${t('mode')} ${String(index + 1)}`}
-                        value={modeOf(group)}
-                        onChange={(event) => { patchGroup(index, { mode: event.target.value }) }}
-                      >
-                        <option value="newapi">{t('modeNewapi')}</option>
-                        <option value="official-direct">{t('modeOfficial')}</option>
-                      </select>
-                      {modeOf(group) === 'official-direct' ? <span className="newapi-hint">{t('modeOfficialHint')}</span> : null}
+                      <label htmlFor={`newapi-name-${index}`}>{t('groupName')}</label>
+                      <input
+                        id={`newapi-name-${index}`} type="text" className="newapi-input"
+                        placeholder={t('groupNamePlaceholder')} value={textOf(group, 'name')}
+                        aria-label={`${t('groupName')} ${String(index + 1)}`}
+                        onChange={(event) => { patchGroup(index, { name: event.target.value }) }}
+                      />
                     </div>
-
-                    {modeOf(group) === 'official-direct'
-                      ? (
-                        <>
-                          <div className="newapi-field">
-                            <label htmlFor={`newapi-okey-${index}`}>{t('officialKeyInput')}</label>
-                            <input
-                              id={`newapi-okey-${index}`} type="password" autoComplete="off" className="newapi-input"
-                              disabled={officialCred?.locked === true}
-                              aria-label={`${t('officialKeyInput')} ${String(index + 1)}`}
-                              placeholder={officialCred?.locked === true
-                                ? t('keyEnvLocked')
-                                : officialCred?.configured === true ? t('keyStored') : t('keyMissing')}
-                              value={officialKeyDraft}
-                              onChange={(event) => {
-                                setKeyDrafts(current => ({ ...current, [officialRef]: event.target.value }))
-                              }}
-                            />
-                          </div>
-
-                          <div className="newapi-field">
-                            <label htmlFor={`newapi-obase-${index}`}>{t('officialBaseUrl')}</label>
-                            <input
-                              id={`newapi-obase-${index}`} type="text" className="newapi-input" placeholder={t('officialBaseUrlPlaceholder')}
-                              value={textOf(group, 'officialBaseURL')}
-                              aria-label={`${t('officialBaseUrl')} ${String(index + 1)}`}
-                              onChange={(event) => { patchGroup(index, { officialBaseURL: event.target.value }) }}
-                            />
-                          </div>
-                        </>
-                      )
-                      : (
-                        <>
-                          <div className="newapi-field">
-                            <label htmlFor={`newapi-key-${index}`}>{t('keyInput')}</label>
-                            <input
-                              id={`newapi-key-${index}`} type="password" autoComplete="off" className="newapi-input"
-                              disabled={cred?.locked === true}
-                              aria-label={`${t('keyInput')} ${String(index + 1)}`}
-                              placeholder={cred?.locked === true
-                                ? t('keyEnvLocked')
-                                : cred?.configured === true ? t('keyStored') : t('keyMissing')}
-                              value={keyDraft}
-                              onChange={(event) => {
-                                setKeyDrafts(current => ({ ...current, [ref]: event.target.value }))
-                              }}
-                            />
-                          </div>
-
-                          <div className="newapi-field">
-                            <div className="newapi-curl-labelrow">
-                              <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
-                              <button
-                                type="button" className="newapi-linkbutton"
-                                aria-expanded={curlOpen.has(index)}
-                                onClick={() => setCurlOpen(current => {
-                                  const next = new Set(current)
-                                  if (next.has(index)) next.delete(index)
-                                  else next.add(index)
-                                  return next
-                                })}
-                              >
-                                {curlOpen.has(index) ? t('curlHide') : t('curlShow')}
-                              </button>
-                            </div>
-                            <input
-                              id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
-                              value={textOf(group, 'baseURL')}
-                              aria-label={`${t('baseUrl')} ${String(index + 1)}`}
-                              onChange={(event) => {
-                                patchGroup(index, { baseURL: event.target.value })
-                                setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
-                              }}
-                            />
-                            {curlOpen.has(index)
-                              ? (() => {
-                                const generatedCurl = curlExample(
-                                  textOf(group, 'baseURL') || t('baseUrlPlaceholder'),
-                                  apiTypeOf(group),
-                                  textOf(modelsOf(group)[0] ?? {}, 'id') || '<YOUR_MODEL_ID>',
-                                )
-                                const curl = curlDrafts.get(index) ?? generatedCurl
-                                return (
-                                  <div className="newapi-curl-panel">
-                                    <div className="newapi-curl-toolbar">
-                                      <span className="newapi-hint">{t('curlHint')}</span>
-                                      <button
-                                        type="button" className="newapi-linkbutton"
-                                        onClick={() => {
-                                          void (async () => {
-                                            try {
-                                              await navigator.clipboard.writeText(curl)
-                                              setCopiedCurl(curl)
-                                            } catch {
-                                              setNotice(t('curlCopyFailed'))
-                                            }
-                                          })()
-                                        }}
-                                      >
-                                        {copiedCurl === curl ? t('curlCopied') : t('curlCopy')}
-                                      </button>
-                                    </div>
-                                    <textarea
-                                      className="newapi-curl-editor"
-                                      aria-label={t('curlEditor')}
-                                      spellCheck={false}
-                                      value={curl}
-                                      onChange={(event) => setCurlDrafts(current => new Map(current).set(index, event.target.value))}
-                                    />
-                                    <button
-                                      type="button" className="newapi-button newapi-button--primary"
-                                      disabled={busy || !writable}
-                                      onClick={() => { void applyCurl(index, curl) }}
-                                    >
-                                      {t('curlApply')}
-                                    </button>
-                                  </div>
-                                )
-                              })()
-                              : null}
-                          </div>
-
-                          <div className="newapi-field">
-                            <label htmlFor={`newapi-type-${index}`}>{t('apiType')}</label>
-                            <select
-                              id={`newapi-type-${index}`} className="newapi-select"
-                              aria-label={`${t('apiType')} ${String(index + 1)}`}
-                              value={apiTypeOf(group)}
-                              onChange={(event) => {
-                                patchGroup(index, { apiType: event.target.value })
-                                setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
-                              }}
-                            >
-                              <option value="chat">{t('apiTypeChat')}</option>
-                              <option value="responses">{t('apiTypeResponses')}</option>
-                              <option value="messages">{t('apiTypeMessages')}</option>
-                            </select>
-                            {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
-                            {apiTypeOf(group) === 'messages' ? <span className="newapi-hint">{t('apiTypeMessagesHint')}</span> : null}
-                          </div>
-
-                          <div className="newapi-proxyrow">
-                            <label>
-                              <input
-                                type="checkbox" checked={groupProxy.enabled}
-                                aria-label={`${t('proxyToggle')} ${String(index + 1)}`}
-                                onChange={(event) => {
-                                  setProxies(current => new Map(current).set(gid, { ...groupProxy, enabled: event.target.checked }))
-                                }}
-                              />
-                              {t('proxyToggle')}
-                            </label>
-                            {groupProxy.enabled
-                              ? (
-                                <input
-                                  className="newapi-input" type="text" style={{ maxWidth: 220 }}
-                                  aria-label={`${t('proxyUrl')} ${String(index + 1)}`} placeholder={DEFAULT_PROXY_URL}
-                                  value={groupProxy.url}
-                                  onChange={(event) => {
-                                    setProxies(current => new Map(current).set(gid, { ...groupProxy, url: event.target.value }))
+                    <div className="newapi-field">
+                      <div className="newapi-curl-labelrow">
+                        <label htmlFor={`newapi-base-${index}`}>{t('baseUrl')}</label>
+                        <button
+                          type="button" className="newapi-linkbutton"
+                          aria-expanded={curlOpen.has(index)}
+                          onClick={() => setCurlOpen(current => {
+                            const next = new Set(current)
+                            if (next.has(index)) next.delete(index)
+                            else next.add(index)
+                            return next
+                          })}
+                        >
+                          {curlOpen.has(index) ? t('curlHide') : t('curlShow')}
+                        </button>
+                      </div>
+                      <input
+                        id={`newapi-base-${index}`} type="text" className="newapi-input" placeholder={t('baseUrlPlaceholder')}
+                        value={textOf(group, 'baseURL')}
+                        aria-label={`${t('baseUrl')} ${String(index + 1)}`}
+                        onChange={(event) => {
+                          patchGroup(index, { baseURL: event.target.value })
+                          setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
+                        }}
+                      />
+                      {curlOpen.has(index)
+                        ? (() => {
+                          const generatedCurl = curlExample(
+                            textOf(group, 'baseURL') || t('baseUrlPlaceholder'),
+                            apiTypeOf(group),
+                            textOf(modelsOf(group)[0] ?? {}, 'id') || '<YOUR_MODEL_ID>',
+                          )
+                          const curl = curlDrafts.get(index) ?? generatedCurl
+                          return (
+                            <div className="newapi-curl-panel">
+                              <div className="newapi-curl-toolbar">
+                                <span className="newapi-hint">{t('curlHint')}</span>
+                                <button
+                                  type="button" className="newapi-linkbutton"
+                                  onClick={() => {
+                                    void (async () => {
+                                      try {
+                                        await navigator.clipboard.writeText(curl)
+                                        setCopiedCurl(curl)
+                                      } catch {
+                                        setNotice(t('curlCopyFailed'))
+                                      }
+                                    })()
                                   }}
-                                />
-                              )
-                              : null}
-                          </div>
+                                >
+                                  {copiedCurl === curl ? t('curlCopied') : t('curlCopy')}
+                                </button>
+                              </div>
+                              <textarea
+                                className="newapi-curl-editor" aria-label={t('curlEditor')} spellCheck={false}
+                                value={curl}
+                                onChange={(event) => setCurlDrafts(current => new Map(current).set(index, event.target.value))}
+                              />
+                              <button
+                                type="button" className="newapi-button newapi-button--primary"
+                                disabled={busy || !writable}
+                                onClick={() => { void applyCurl(index, curl) }}
+                              >{t('curlApply')}</button>
+                            </div>
+                          )
+                        })()
+                        : null}
+                    </div>
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-type-${index}`}>{t('apiType')}</label>
+                      <select
+                        id={`newapi-type-${index}`} className="newapi-select"
+                        aria-label={`${t('apiType')} ${String(index + 1)}`}
+                        value={apiTypeOf(group)}
+                        onChange={(event) => {
+                          patchGroup(index, { apiType: event.target.value })
+                          setCurlDrafts(current => { const next = new Map(current); next.delete(index); return next })
+                        }}
+                      >
+                        <option value="chat">{t('apiTypeChat')}</option>
+                        <option value="responses">{t('apiTypeResponses')}</option>
+                        <option value="messages">{t('apiTypeMessages')}</option>
+                      </select>
+                      {apiTypeOf(group) === 'responses' ? <span className="newapi-hint">{t('apiTypeResponsesHint')}</span> : null}
+                      {apiTypeOf(group) === 'messages' ? <span className="newapi-hint">{t('apiTypeMessagesHint')}</span> : null}
+                    </div>
+                    <div className="newapi-field">
+                      <label htmlFor={`newapi-key-${index}`}>{t('keyInput')}</label>
+                      <input
+                        id={`newapi-key-${index}`} type="password" autoComplete="off" className="newapi-input"
+                        disabled={cred?.locked === true}
+                        aria-label={`${t('keyInput')} ${String(index + 1)}`}
+                        placeholder={cred?.locked === true ? t('keyEnvLocked') : cred?.configured === true ? t('keyStored') : t('keyMissing')}
+                        value={keyDraft}
+                        onChange={(event) => { setKeyDrafts(current => ({ ...current, [ref]: event.target.value })) }}
+                      />
+                    </div>
+                    <div className="newapi-proxyrow">
+                      <label>
+                        <input
+                          type="checkbox" checked={groupProxy.enabled}
+                          aria-label={`${t('proxyToggle')} ${String(index + 1)}`}
+                          onChange={(event) => { setProxies(current => new Map(current).set(gid, { ...groupProxy, enabled: event.target.checked })) }}
+                        />
+                        {t('proxyToggle')}
+                      </label>
+                      {groupProxy.enabled ? (
+                        <input
+                          className="newapi-input" type="text" style={{ maxWidth: 220 }}
+                          aria-label={`${t('proxyUrl')} ${String(index + 1)}`} placeholder={DEFAULT_PROXY_URL}
+                          value={groupProxy.url}
+                          onChange={(event) => { setProxies(current => new Map(current).set(gid, { ...groupProxy, url: event.target.value })) }}
+                        />
+                      ) : null}
+                    </div>
 
                           <section className="newapi-catalog" aria-label={`${t('models')} ${String(index + 1)}`}>
                             <div className="newapi-catalog-head">
@@ -1323,7 +1231,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                       </button>
                     </section>
 
-                    {modeOf(group) === 'newapi' && groupCandidates !== undefined ? (
+                    {groupCandidates !== undefined ? (
                       <div className="newapi-candidates">
                         <div className="newapi-candidates-head">
                           <strong>{t('fetchTitle')}</strong>
@@ -1363,7 +1271,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                       </div>
                      ) : null}
 
-                    {modeOf(group) === 'newapi' && groupParams !== undefined ? (
+                    {groupParams !== undefined ? (
                       <div className="newapi-params" ref={paramsRef}>
                         <strong>{t('paramsTitle')}</strong>
                         <p className="newapi-params-summary">{
@@ -1434,8 +1342,6 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                         </div>
                       </div>
                      ) : null}
-                        </>
-                      )}
                   </div>
                 )
                 : null}

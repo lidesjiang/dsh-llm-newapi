@@ -43,6 +43,7 @@ const NS = 'settings.newapi'
 const SECTION_CSS = `
 .newapi-intro { color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 20px; margin: 0 0 12px; }
 .newapi-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.newapi-field > label { color: var(--dsw-alias-label-primary); font-size: 13px; }
 .newapi-input {
   box-sizing: border-box; padding: 6px 10px; border-radius: 8px;
   border: 1px solid var(--dsw-alias-border-l2);
@@ -77,6 +78,11 @@ const SECTION_CSS = `
    name/route badge/status/count, and an expanding body. */
 .newapi-groups { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
 .newapi-group {
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 14px;
+  background: var(--dsw-alias-bg-layer-2);
+  padding: 16px;
+}
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 10px;
   background: var(--dsw-alias-bg-layer-1);
@@ -132,6 +138,10 @@ const SECTION_CSS = `
 .newapi-linkbutton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .newapi-linkbutton:disabled { opacity: 0.4; cursor: default; }
 .newapi-empty { margin: 0; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 18px; }
+.newapi-catalog > .newapi-empty {
+  box-sizing: border-box; padding: 16px; text-align: center;
+  border: 1px dashed var(--dsw-alias-border-l2); border-radius: 10px;
+}
 .newapi-entry {
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 8px;

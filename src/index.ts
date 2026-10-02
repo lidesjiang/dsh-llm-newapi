@@ -24,22 +24,13 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { LlmConfigurableProvider, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
-import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
-import type { AnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
-import { DeepSeekAdapter, resolveAdapterOptions as resolveOfficialOptions } from '@deepseek-ai/dsh-llm-deepseek'
-import type { DeepSeekCatalogModel } from '@deepseek-ai/dsh-llm-deepseek'
 // Type-only: pulls the cordis Context augmentation declaring ctx.settings
 // (SettingsProvider), which the removed installSettingsSection import used
 // to load transitively (0.1.2 migration).
 import type {} from '@deepseek-ai/dsh-settings'
-// Type-only: the official-direct delegate reuses the official adapter's
-// service wiring (ctx.fs host-path mapping, deepseek-llm-api extensions),
-// so the Context augmentations must load in this program.
-import type {} from '@deepseek-ai/dsh-fs'
-import type {} from '@deepseek-ai/dsh-deepseek-llm-api-extensions'
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MODEL_EXCLUDE_PATTERNS,
@@ -48,7 +39,7 @@ import {
   normalizeBaseUrl,
   PKG,
 } from './adapter.ts'
-import type { NewApiCatalogModel, NewApiConnectionOptions, NewApiMode, OfficialAdapterDelegate } from './adapter.ts'
+import type { NewApiCatalogModel, NewApiConnectionOptions } from './adapter.ts'
 import type { ModelsDevParamsRequest, ProviderHints } from './types.ts'
 import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 
@@ -69,8 +60,6 @@ export type {
   NewApiAdapterOptions,
   NewApiCatalogModel,
   NewApiConnectionOptions,
-  NewApiMode,
-  OfficialAdapterDelegate,
 } from './adapter.ts'
 export type * from './types.ts'
 
@@ -83,8 +72,6 @@ const NS = 'llm-newapi'
 const BASE_URL_ENV = 'NEWAPI_BASE_URL'
 /** Placeholder gateway base used when neither config nor environment names one. */
 export const DEFAULT_BASE_URL = 'https://newapi.example.com/v1'
-/** Default DeepSeek official API base for official-direct groups (no `/v1`). */
-export const DEFAULT_OFFICIAL_BASE_URL = 'https://api.deepseek.com'
 
 // ─── Group helpers ─────────────────────────────────────────────────────────
 
@@ -108,17 +95,6 @@ function groupCredRef(id: string) {
   return credentialRef(id === 'newapi' ? 'newapi' : `newapi_${safe}`)
 }
 
-/**
- * Derived credential reference for a group's official-direct API key. The
- * `deepseek_official` prefix can never collide with a gateway ref (`newapi`
- * or `newapi_<id>`) nor with the official plugin's own `DEEPSEEK_API_KEY`
- * reference, so a group keeps one key per mode: switching modes never
- * overwrites one generation's key with the other's.
- */
-function groupOfficialCredRef(id: string) {
-  const safe = id.replace(/[^A-Za-z0-9_]/g, '_')
-  return credentialRef(id === 'newapi' ? 'deepseek_official' : `deepseek_official_${safe}`)
-}
 
 /**
  * The settings path to one group's profile, for directory consumers that walk
@@ -150,25 +126,6 @@ export interface GroupConfig {
    * for agents / multi-step output / tool calling).
    */
   apiType?: 'chat' | 'responses' | 'messages'
-  /**
-   * Wire mode: `newapi` (default) relays through the gateway;
-   * `official-direct` delegates to the official DeepSeek adapter — requests
-   * go to {@link officialBaseURL} with the key stored under
-   * {@link officialApiKeyRef}, with full reasoning-block, `reasoning_effort`,
-   * and tool-call support straight from the official wire format.
-   */
-  mode?: NewApiMode
-  /**
-   * DeepSeek official API base used in official-direct mode; default
-   * `https://api.deepseek.com` (no `/v1` requirement).
-   */
-  officialBaseURL?: string
-  /**
-   * Credential reference for the official API key in official-direct mode;
-   * defaults to the group's derived `deepseek_official_<id>` ref. Must match
-   * `/^[A-Za-z_][A-Za-z0-9_]*$/` (no hyphens).
-   */
-  officialApiKeyRef?: string
   /** Gateway base including the `/v1` prefix; may be a blank draft before the URL is typed (placeholder then). */
   baseURL?: string
   /** Advisory models catalog. */
@@ -194,9 +151,6 @@ export interface Config {
   /** Group list. When absent, legacy flat fields are used as a single group. */
   groups?: GroupConfig[]
   // Legacy flat fields, accepted when `groups` is absent:
-  mode?: NewApiMode
-  officialBaseURL?: string
-  officialApiKeyRef?: string
   baseURL?: string
   models?: NewApiCatalogModel[]
   modelExcludePatterns?: string[]
@@ -237,11 +191,6 @@ const groupSchema: z<GroupConfig> = z.object({
   id: z.string().required(),
   name: z.string(),
   apiType: z.union(['chat', 'responses', 'messages']),
-  mode: z.union(['newapi', 'official-direct']),
-  // No default: the official endpoint needs no /v1 prefix and resolveGroupOptions
-  // falls back to DEFAULT_OFFICIAL_BASE_URL for official-direct groups.
-  officialBaseURL: z.string(),
-  officialApiKeyRef: z.string(),
   // Optional: the UI may save a group before the user typed a base URL, and
   // resolveGroupOptions falls back to the DEFAULT_BASE_URL placeholder then.
   baseURL: z.string(),
@@ -261,9 +210,6 @@ const groupSchema: z<GroupConfig> = z.object({
 export const Config = z.object({
   groups: z.array(groupSchema).default([]).volatile(),
   // Legacy flat fields: accepted when groups is absent.
-  mode: z.union(['newapi', 'official-direct']).volatile(),
-  officialBaseURL: z.string().volatile(),
-  officialApiKeyRef: z.string().volatile(),
   baseURL: z.string().volatile(),
   models: z.array(catalogModel).default([]).volatile(),
   modelExcludePatterns: z.array(z.string()).default([...DEFAULT_MODEL_EXCLUDE_PATTERNS]).volatile(),
@@ -326,34 +272,6 @@ function resolveModels(models: readonly NewApiCatalogModel[] | undefined): NewAp
   })
 }
 
-/**
- * Map this plugin's gateway catalog rows onto the official adapter's catalog
- * shape. An official-direct group reuses the official adapter for transport,
- * so a group that declares its own models must hand them over in the official
- * shape: `vision: true` becomes `['text', 'image']`, and the image bounds stay
- * unset so the official resolver applies its own defaults. That last part is
- * load-bearing — the official resolver rejects a text-only row that carries
- * image request limits ("cannot declare image request limits"), so the bounds
- * must never be copied onto a row whose modalities do not include `image`.
- * @param models - the group's already-resolved catalog rows.
- * @returns the official-shaped catalog, or `undefined` when the group declares
- *   no models of its own (the caller then leaves the official built-in
- *   catalog in force instead of overriding it with an empty list).
- */
-function officialCatalogOf(
-  models: readonly NewApiCatalogModel[],
-): DeepSeekCatalogModel[] | undefined {
-  if (models.length === 0) return undefined
-  return models.map(model => ({
-    id: model.id,
-    ...model.name === undefined ? {} : { name: model.name },
-    ...model.description === undefined ? {} : { description: model.description },
-    ...model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow },
-    ...model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens },
-    ...model.vision === true ? { inputModalities: ['text', 'image'] as const } : {},
-  }))
-}
-
 // ─── Group resolution ──────────────────────────────────────────────────────
 
 /** Derive the group list from the resolved config, with legacy fallback. */
@@ -369,9 +287,6 @@ function expandGroups(config: Config, environment?: ReturnType<typeof launchEnvi
     id: 'newapi',
     name: 'NewAPI',
     baseURL: named !== undefined && named.trim().length > 0 ? named : DEFAULT_BASE_URL,
-    ...config.mode === undefined ? {} : { mode: config.mode },
-    ...config.officialBaseURL === undefined ? {} : { officialBaseURL: config.officialBaseURL },
-    ...config.officialApiKeyRef === undefined ? {} : { officialApiKeyRef: config.officialApiKeyRef },
     ...config.models === undefined ? {} : { models: config.models },
     ...config.modelExcludePatterns === undefined ? {} : { modelExcludePatterns: config.modelExcludePatterns },
     ...config.defaultContextWindow === undefined ? {} : { defaultContextWindow: config.defaultContextWindow },
@@ -404,20 +319,9 @@ export function resolveGroupOptions(
   environment?: ReturnType<typeof launchEnvironmentOf>,
 ): NewApiConnectionOptions {
   const route = groupRoute(group.id)
-  const mode: NewApiMode = group.mode === 'official-direct' ? 'official-direct' : 'newapi'
-  // The gateway base is inert in official-direct mode: the group's gateway
-  // fields (which may be a stale or half-typed draft) must not gate a mode
-  // that never uses them. The placeholder keeps the fact shape total. An
-  // absent or blank base (a group saved before its URL was typed) falls
-  // back to the placeholder in BOTH modes — in newapi mode the first
-  // request then fails loudly naming the endpoint.
+  // An absent or blank base (a group saved before its URL was typed) falls
+  // back to a placeholder; the first request then fails naming the endpoint.
   const rawBase = group.baseURL !== undefined && group.baseURL.trim().length > 0 ? group.baseURL : DEFAULT_BASE_URL
-  if (group.officialApiKeyRef !== undefined && group.officialApiKeyRef.length > 0
-    && !isCredentialRefName(group.officialApiKeyRef)) {
-    throw new Error(
-      `${PKG}: officialApiKeyRef must match /^[A-Za-z_][A-Za-z0-9_]*$/ (got: ${group.officialApiKeyRef})`,
-    )
-  }
   const modelExcludePatterns = group.modelExcludePatterns ?? [...DEFAULT_MODEL_EXCLUDE_PATTERNS]
   for (const pattern of modelExcludePatterns) {
     if (pattern.length === 0) throw new Error(`${PKG}: modelExcludePatterns entries must be non-empty`)
@@ -446,22 +350,7 @@ export function resolveGroupOptions(
     provider: route,
     displayName: group.name ?? group.id,
     apiType: group.apiType === 'responses' || group.apiType === 'messages' ? group.apiType : 'chat',
-    mode,
-    ...mode === 'newapi'
-      ? { baseURL: normalizeBaseUrl(rawBase) }
-      : {
-        // Inert placeholder: official-direct requests never touch it.
-        baseURL: DEFAULT_BASE_URL,
-        officialBaseURL: normalizeBaseUrl(
-          group.officialBaseURL !== undefined && group.officialBaseURL.trim().length > 0
-            ? group.officialBaseURL
-            : DEFAULT_OFFICIAL_BASE_URL,
-          'officialBaseURL must be an absolute http(s) URL, e.g. https://api.deepseek.com',
-        ),
-        officialApiKeyRef: group.officialApiKeyRef !== undefined && group.officialApiKeyRef.length > 0
-          ? credentialRef(group.officialApiKeyRef)
-          : groupOfficialCredRef(group.id),
-      },
+    baseURL: normalizeBaseUrl(rawBase),
     apiKeyRef: groupCredRef(group.id),
     models: resolveModels(group.models),
     modelExcludePatterns,
@@ -556,75 +445,6 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
-  /**
-   * Build the official-direct delegate for one connection snapshot. The
-   * official `resolveAdapterOptions` fills every official-adapter default
-   * (built-in V4 catalog, 1M context, 256K maxTokens, Files-API image
-   * bounds) from a minimal config; the two facts this plugin owns — the
-   * endpoint and the credential reference — come from the group's
-   * official-direct fields. The bearer token resolves through the same
-   * credentials seam as the gateway key, but from the group's official ref,
-   * so the two modes keep independent keys. The anonymous user id is the
-   * same harness-home id the official route itself would send: the requests
-   * hit the official API and carry its expected telemetry headers.
-   */
-  const createOfficialAdapter = (connection: NewApiConnectionOptions): OfficialAdapterDelegate => {
-    // A group that declares its own catalog overrides the official built-in
-    // one; a group with no models of its own (the common case, and every
-    // route pointed at the real DeepSeek endpoint) keeps the official list.
-    // Passing an empty array would do the opposite — the official resolver
-    // treats `models: []` as an authoritative empty catalog, not as "unset" —
-    // so the field is omitted entirely instead.
-    const models = officialCatalogOf(connection.models)
-    const official = resolveOfficialOptions({
-      // The 0.2 DeepSeek adapter speaks the Messages API. Credentials stay out
-      // of its connection snapshot and are resolved per request below.
-      ...(connection.officialBaseURL !== undefined ? { baseURL: connection.officialBaseURL } : {}),
-      ...models === undefined ? {} : { models },
-      streamIdleTimeoutMs: connection.streamIdleTimeoutMs,
-    })
-    const resolveOfficialApiKey = async (): Promise<string> => {
-      const ref = connection.officialApiKeyRef
-      if (ref === undefined) {
-        throw new LlmError(
-          `${PKG}: provider route "${connection.provider}" has no official API key reference`,
-          'MISSING_CREDENTIAL',
-        )
-      }
-      const credentials = ctx.get('credentials')
-      if (credentials !== undefined) {
-        const hit = await credentials.resolve(ref)
-        if (hit !== undefined) return assertUsableApiKey(hit.value, PKG, ref)
-      }
-      throw new LlmError(
-        `${PKG}: no official API key for provider route "${connection.provider}"; configure it on`
-          + ` the NewAPI settings page in dsh web (official-direct mode, credentials reference "${ref}")`,
-        'MISSING_CREDENTIAL',
-      )
-    }
-    let userId: AnonymousUserId | undefined
-    return new DeepSeekAdapter({
-      options: () => official,
-      resolveAuth: async () => ({ headers: { Authorization: `Bearer ${await resolveOfficialApiKey()}` } }),
-      resolveUserId: () => userId ??= getOrCreateAnonymousUserId(),
-      // Image support rides the durable attachment service when mounted —
-      // the official adapter's vision path (Files API with base64 fallback)
-      // engages only for its own vision catalog rows.
-      resolveAttachments: () => ctx.get('attachments'),
-      resolveImageAccess: (attachments, ref) => resolveImageAttachmentAccess(
-        attachments,
-        hostPath => ctx.get('fs')?.processPathFromHostPath(hostPath),
-        ref,
-      ),
-      prepareExtensions: (request) => {
-        return ctx.get('deepseekLlmApiExtensions')?.prepare(request) ?? Promise.resolve({
-          fields: {},
-          accept: () => Promise.resolve(),
-        })
-      },
-    })
-  }
-
   // Official-vendor index for the models.dev params panel: model id → the
   // provider route that serves it officially, read from every OTHER route.
   let indexCache: { routes: string; byModel: Map<string, string> } | undefined
@@ -653,8 +473,6 @@ export function apply(ctx: Context, config: Config): void {
     options,
     defaultProvider,
     resolveApiKey,
-    officialProviderOf,
-    createOfficialAdapter,
     // Resolve image bytes from the attachment store lazily: the service may
     // mount after this plugin, so read it per request. Absent service (or a
     // vision row with no resolver) keeps the text-only wire.

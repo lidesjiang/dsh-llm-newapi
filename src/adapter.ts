@@ -7,14 +7,6 @@
  * are emitted and no harness telemetry headers are sent: the mandatory
  * attribution `User-Agent` is the only product identity on the wire.
  *
- * One mode escapes the gateway entirely: a connection whose `mode` is
- * `official-direct` delegates `stream` / `listModels` / `resolveModel` /
- * discovery to an {@link OfficialAdapterDelegate} built from that same
- * connection snapshot (the official DeepSeek adapter), so reasoning blocks,
- * `reasoning_effort`, and tool calls reach the official endpoint without
- * gateway translation loss. The official route itself is never registered —
- * delegation, not replacement.
- *
  * @module dsh-llm-newapi/adapter
  */
 
@@ -102,15 +94,6 @@ export interface NewApiCatalogModel {
 }
 
 /**
- * The wire mode of one connection. `newapi` (default, and the behavior when
- * the field is absent) relays through the OpenAI-compatible gateway;
- * `official-direct` delegates every model operation to the official
- * DeepSeek adapter so reasoning blocks, `reasoning_effort`, and tool calls
- * reach the official endpoint without gateway loss.
- */
-export type NewApiMode = 'newapi' | 'official-direct'
-
-/**
  * Validated connection facts for one operation. The plugin's
  * `resolveAdapterOptions` is the one explicit resolve step producing this
  * shape; the adapter trusts it and re-reads it per operation, which is what
@@ -139,26 +122,6 @@ export interface NewApiConnectionOptions {
    * literal key is not a configuration value.
    */
   apiKeyRef: CredentialRef
-  /**
-   * Wire mode: absent or `newapi` relays through the gateway; `official-direct`
-   * delegates to the official DeepSeek adapter built from
-   * {@link officialBaseURL} and {@link officialApiKeyRef}.
-   */
-  mode?: NewApiMode
-  /**
-   * DeepSeek official API base used in official-direct mode (no `/v1`
-   * requirement — the official adapter appends `/chat/completions` itself).
-   * Present only while the mode is `official-direct`; the gateway
-   * {@link baseURL} is not validated in that mode.
-   */
-  officialBaseURL?: string
-  /**
-   * Credential reference for the official API key in official-direct mode;
-   * resolved per request through the same credentials seam as
-   * {@link apiKeyRef}, but stored separately so switching modes never
-   * overwrites one generation's key with the other's.
-   */
-  officialApiKeyRef?: CredentialRef
   /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
   models: readonly NewApiCatalogModel[]
   /**
@@ -216,32 +179,6 @@ export interface NewApiAdapterOptions {
    * content explicitly instead of silently dropping it.
    */
   resolveImage?: (ref: ImageAttachmentRef, signal: AbortSignal) => Promise<StoredImageAttachment>
-  /**
-   * Build the official-direct delegate for one connection snapshot: an
-   * object with the official DeepSeek adapter's `stream` / `listModels` /
-   * `resolveModel` surface (the `DeepSeekAdapter` class from
-   * `@deepseek-ai/dsh-llm-deepseek` satisfies it structurally). Called at
-   * most once per connection snapshot — the adapter caches by snapshot
-   * identity, so one config generation reuses one delegate (and its
-   * Files-API upload index). Absent while no group uses official-direct
-   * mode; an official-direct connection without a factory fails loudly.
-   */
-  createOfficialAdapter?: (connection: NewApiConnectionOptions) => OfficialAdapterDelegate
-}
-
-/**
- * The official-adapter surface the official-direct delegation path calls.
- * Deliberately structural (no import from the pinned dependency): the
- * transport-only adapter layer stays independent of the official package,
- * and tests can stub the delegate without its dependency chain.
- */
-export interface OfficialAdapterDelegate {
-  /** Stream one model call against the official endpoint. */
-  stream(options: GenerateOptions): AsyncIterable<StreamChunk>
-  /** The official adapter's built-in model catalog. */
-  listModels(provider: string): Promise<readonly LlmModelInfo[]>
-  /** Official model metadata: context window, reasoning efforts, output caps. */
-  resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
 }
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
@@ -378,9 +315,7 @@ export function matchModelsDev(api: ModelsDevApi, id: string, hints?: ProviderHi
  * step — names the setting to fix instead of surfacing later as an opaque
  * fetch failure.
  * @param raw - the configured or drafted base URL.
- * @param diagnostic - the error fragment naming the field; the default names
- *   the gateway `baseURL` (with its `/v1` requirement), official-direct
- *   passes one for `officialBaseURL` (no `/v1` requirement).
+ * @param diagnostic - the error fragment naming the gateway `baseURL`.
  * @returns the normalized base with no trailing slash.
  */
 export function normalizeBaseUrl(
@@ -520,36 +455,8 @@ function imageDataUrl(image: StoredImageAttachment): string {
  * map to `ABORTED`; the configured per-read idle watchdog maps to `TIMEOUT`.
  */
 export class NewApiAdapter extends LlmAdapter {
-  /** Cached official-direct delegate, keyed by connection snapshot identity. */
-  private officialDelegate: { connection: NewApiConnectionOptions; delegate: OfficialAdapterDelegate } | undefined
-
   constructor(private readonly config: NewApiAdapterOptions) {
     super()
-  }
-
-  /**
-   * The official-direct delegate for one connection snapshot. The plugin's
-   * `options(provider)` thunk returns one stable object per config
-   * generation, so identity comparison caches exactly one delegate (and its
-   * Files-API upload index) per generation; a settings change mints the
-   * next one on its first request.
-   * @param connection - the connection snapshot to delegate for.
-   * @returns the official adapter delegate for that snapshot.
-   */
-  private officialAdapterFor(connection: NewApiConnectionOptions): OfficialAdapterDelegate {
-    if (this.officialDelegate !== undefined && this.officialDelegate.connection === connection) {
-      return this.officialDelegate.delegate
-    }
-    const factory = this.config.createOfficialAdapter
-    if (factory === undefined) {
-      throw new LlmError(
-        `${PKG}: provider route "${connection.provider}" is configured for official-direct mode but no official adapter factory is wired`,
-        'INVALID_REQUEST',
-      )
-    }
-    const delegate = factory(connection)
-    this.officialDelegate = { connection, delegate }
-    return delegate
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -565,11 +472,6 @@ export class NewApiAdapter extends LlmAdapter {
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     const connection = this.config.options(provider)
-    // Official-direct: the official adapter's built-in catalog (V4 Flash/Pro/
-    // Vision) is the authoritative list, with official capacities.
-    if (connection.mode === 'official-direct') {
-      return this.officialAdapterFor(connection).listModels(provider)
-    }
     return Promise.resolve(connection.models.map(model => modelInfo(provider, model)))
   }
 
@@ -579,12 +481,6 @@ export class NewApiAdapter extends LlmAdapter {
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
     const connection = this.config.options(provider)
-    // Official-direct: delegate wholesale so the context window, the
-    // off/low/high/max reasoning-effort selector, and the output cap all
-    // come from the official adapter's own catalog instead of models.dev.
-    if (connection.mode === 'official-direct') {
-      return this.officialAdapterFor(connection).resolveModel(provider, model, _signal)
-    }
     const configured = connection.models.find(entry => entry.id === model)
     const defaultMaxTokens = configured?.maxTokens ?? connection.maxTokens
     return Promise.resolve({
@@ -645,24 +541,6 @@ export class NewApiAdapter extends LlmAdapter {
     const connection = request.provider !== undefined
       ? this.config.options(request.provider)
       : this.config.options(this.defaultProviderRoute())
-    // Official-direct: the built-in official catalog is the model list —
-    // deterministic, offline, and identical to what the official route
-    // advertises. Draft endpoints and one-shot credentials are gateway
-    // concepts and do not apply.
-    if (connection.mode === 'official-direct') {
-      const delegate = this.officialAdapterFor(connection)
-      const listed = await delegate.listModels(connection.provider)
-      const models = await Promise.all(listed.map(async (info) => {
-        const resolved = await delegate.resolveModel(connection.provider, info.id, signal)
-        return {
-          id: info.id,
-          ...info.name !== info.id ? { name: info.name } : {},
-          ...resolved.context?.contextWindow !== undefined ? { contextWindow: resolved.context.contextWindow } : {},
-        }
-      }))
-      models.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-      return models
-    }
     const base = request.baseURL !== undefined && request.baseURL.length > 0
       ? normalizeBaseUrl(request.baseURL)
       : connection.baseURL
@@ -841,15 +719,6 @@ export class NewApiAdapter extends LlmAdapter {
     // The key resolves *from this snapshot*, so an endpoint and the secret
     // sent to it can never come from different configuration generations.
     const connection = this.config.options(options.provider)
-    // Official-direct: delegate wholesale. The official adapter owns its own
-    // idle watchdog (fed the same streamIdleTimeoutMs), the official
-    // telemetry headers, the Files-API image path, and the reasoning-block
-    // translation for the official endpoint — the gateway translator must
-    // not sit in between, which is the entire point of the mode.
-    if (connection.mode === 'official-direct') {
-      yield* this.officialAdapterFor(connection).stream(options)
-      return
-    }
     const apiKey = await this.config.resolveApiKey(connection)
     const consumer = new AbortController()
     const upstream = options.signal === undefined

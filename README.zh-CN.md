@@ -1,6 +1,6 @@
 # dsh-llm-newapi
 
-为 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness) 添加 NewAPI 网关和 DeepSeek 官方直连支持。插件包含宿主适配器和 Web 设置页，无需修改 dsh 核心。
+为 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness) 添加 NewAPI 网关插件，可连接兼容 OpenAI 或 Anthropic API 的服务。
 
 [English](README.md) | **中文**
 
@@ -11,11 +11,12 @@
 - Claude Messages 使用 `x-api-key` 与 `anthropic-version` 鉴权头，并支持流式响应和工具调用。
 - 设置页提供可编辑的 curl 示例。修改后点击“应用到网关配置”，插件会解析 URL、协议、模型、密钥和 token 上限并保存；只解析受支持的 curl 参数，不会执行命令。
 - 可从网关获取模型；支持模型参数信息和代理配置。
-- 可按网关组切换 DeepSeek 官方直连模式，密钥与网关密钥分开保存。
 
 ## 安装与配置
 
 将插件安装到 dsh 的 `web` profile，并在插件设置中添加网关。网关地址填写 API 前缀，例如 `https://api.example.com/v1`；选择对应接口类型，设置密钥并获取或添加模型。保存后即可在模型选择器中使用。
+
+旧版本的 DeepSeek 官方直连配置不会再直连官方 API；请在设置页填入网关地址、选择协议并重新输入密钥。
 
 也可以在插件配置中定义网关组：
 

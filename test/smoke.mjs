@@ -3,31 +3,14 @@
  * cordis Contexts (no network), then assert the provider-side surface —
  * route registration, configurable-provider directory entry, chat-only
  * discovery filtering over a stubbed gateway listing, credential resolution
- * through the credentials service only (no environment fallback), and the
- * settings write point refusing sections the adapter cannot serve.
+ * through the credentials service only (no environment fallback), and gateway
+ * configuration validation.
  */
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { Context, Service } from '@deepseek-ai/cordis'
 import LlmRuntime, { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
-import SettingsProvider from '@deepseek-ai/dsh-settings'
 import * as plugin from '../lib/index.js'
-
-/** In-memory settings provider: the smallest real SettingsProvider subclass. */
-class MemorySettings extends SettingsProvider {
-  doc = {}
-
-  constructor(ctx, options) {
-    super(ctx)
-    this.doc = structuredClone(options?.doc ?? {})
-  }
-
-  get writable() { return true }
-
-  load() { return Promise.resolve(structuredClone(this.doc)) }
-
-  async persist(ns, section) { this.doc[ns] = structuredClone(section) }
-}
 
 /** Minimal credentials service: resolve() only, from an in-memory store. */
 class FakeCredentials extends Service {
@@ -149,31 +132,42 @@ function stubModelsListing() {
   assert.equal(asked.auth, 'Bearer stored-key')
 }
 
-// ── Block C: the settings write point refuses unserviceable sections ──
+// ── Block B2: Messages discovery asks for Anthropic model metadata ──
 {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
-  await ctx.plugin(MemorySettings, {})
-  await ctx.plugin(FakeCredentials, { newapi: 'block-c-key' })
-  await mountPlugin(ctx)
+  await ctx.plugin(FakeCredentials, { newapi: 'messages-key' })
+  await mountPlugin(ctx, {
+    groups: [{ id: 'newapi', apiType: 'messages', baseURL: 'http://claude.local/v1' }],
+  })
 
-  // A schema-valid but unserviceable baseURL rejects at the write, so it can
-  // never store and silently pin the adapter to the last good facts.
-  await assert.rejects(
-    ctx.settings.update('llm-newapi', { baseURL: 'not-a-url' }),
+  const originalFetch = globalThis.fetch
+  let headers
+  globalThis.fetch = async (_url, init) => {
+    headers = new Headers(init?.headers)
+    return new Response(JSON.stringify({
+      data: [{ id: 'claude-sonnet-latest', display_name: 'Claude Sonnet' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  let models
+  try {
+    models = await ctx.llm.discoverModels('llm-newapi', { provider: 'newapi' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(headers.get('x-api-key'), 'messages-key')
+  assert.equal(headers.get('anthropic-version'), '2023-06-01')
+  assert.equal(models[0].name, 'Claude Sonnet')
+}
+
+// ── Block C: runtime config resolution rejects invalid gateway settings ──
+{
+  assert.throws(
+    () => plugin.resolveGroupOptions({ id: 'newapi', baseURL: 'not-a-url' }),
     (error) => error.message.includes('baseURL must be an absolute http(s) URL'),
   )
-
-  // A serviceable section commits and the very next discovery uses it.
-  await ctx.settings.update('llm-newapi', { baseURL: 'http://settings-gw:9000/v1' })
-  const { asked, restore } = stubModelsListing()
-  try {
-    const found = await ctx.llm.discoverModels('llm-newapi', { provider: 'newapi' })
-    assert.equal(found.length, 2)
-  } finally {
-    restore()
-  }
-  assert.equal(asked.url, 'http://settings-gw:9000/v1/models')
+  const resolved = plugin.resolveGroupOptions({ id: 'newapi', baseURL: 'http://settings-gw:9000/v1/' })
+  assert.equal(resolved.baseURL, 'http://settings-gw:9000/v1')
 }
 
 // ── Block D: discovery ordering, display names, and the models.dev match ──
@@ -294,10 +288,9 @@ function stubModelsListing() {
   assert.equal(wired.reasoning_effort, 'high')
   assert.equal('reasoning_effort' in plugin.serializeRequest({ model: 'qwen3-32b', messages: [] }), false)
 
-  // The settings write point refuses an enabled proxy with a non-http(s) url.
-  await ctx.plugin(MemorySettings, {})
-  await assert.rejects(
-    ctx.settings.update('llm-newapi', { proxy: { enabled: true, url: 'ftp://x' } }),
+  // Runtime config resolution refuses an enabled proxy with a non-http(s) URL.
+  assert.throws(
+    () => plugin.resolveGroupOptions({ id: 'newapi', proxy: { enabled: true, url: 'ftp://x' } }),
     (error) => error.message.includes('proxy.url must be an http(s) URL'),
   )
 }
@@ -514,10 +507,7 @@ function stubModelsListing() {
         { type: 'text', text: '' },
         { type: 'tool-call', id: 'call_1', name: 'get_time', arguments: '{}' },
       ] },
-      { role: 'user', content: [
-        { type: 'text', text: '' },
-        { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '12:00' }] },
-      ] },
+      { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: '12:00' }] },
     ],
     tools: [{ name: 'get_time', description: 'current time', parameters: { type: 'object' } }],
     maxTokens: 4096,
@@ -626,4 +616,4 @@ function stubModelsListing() {
   }
 }
 
-console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, settings validation, ordering, display names, models.dev matching, deferred RPC channel, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')
+console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, config validation, ordering, display names, models.dev matching, deferred RPC channel, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')

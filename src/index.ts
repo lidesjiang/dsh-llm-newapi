@@ -473,6 +473,7 @@ export function apply(ctx: Context, config: Config): void {
     options,
     defaultProvider,
     resolveApiKey,
+    officialProviderOf,
     // Resolve image bytes from the attachment store lazily: the service may
     // mount after this plugin, so read it per request. Absent service (or a
     // vision row with no resolver) keeps the text-only wire.

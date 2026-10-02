@@ -12,10 +12,13 @@ afterEach(cleanup)
 
 const t = (key: keyof typeof en): string => en[key]
 
-/** Expand the first (collapsed) gateway card so its form fields render. */
+/** Ensure the first gateway card is open so its form fields render. */
 async function expandFirstGroup(): Promise<void> {
-  const toggles = await waitFor(() => screen.getAllByLabelText(t('groupExpanded')))
-  fireEvent.click(toggles[0] as HTMLElement)
+  await waitFor(() => {
+    const collapsed = screen.queryAllByLabelText(t('groupExpanded'))[0]
+    if (collapsed !== undefined) fireEvent.click(collapsed)
+    else expect(screen.getByLabelText(t('groupCollapsed'))).toBeTruthy()
+  })
 }
 
 /** One stored group section value (the new groups shape). */
@@ -78,14 +81,14 @@ function paramsFace() {
 }
 
 describe('NewApiSection mount', () => {
-  it('loads the section on mount and renders the nav while collapsed', async () => {
+  it('loads the section on mount and opens a single configured gateway', async () => {
     const api = wireFace()
     render(<NewApiSection api={api as never} t={t} />)
 
-    // Groups start collapsed; the add-group control is visible.
+    // The navigation and add-group control are visible.
     await waitFor(() => { expect(screen.getByText(t('addGroup'))).toBeTruthy() })
-    // The form fields are inside the collapsed group body and therefore not rendered.
-    expect(screen.queryByLabelText(t('baseUrl'))).toBeNull()
+    // A single gateway opens directly so its configuration is immediately accessible.
+    expect(screen.getByLabelText(`${t('baseUrl')} 1`)).toBeTruthy()
 
     // The mount itself interrogated the settings plane.
     expect(api.settings.describe).toHaveBeenCalledTimes(1)

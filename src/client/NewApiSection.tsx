@@ -418,8 +418,8 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         }
         setCredentials(byRef)
       }
-      // Groups start collapsed: with several gateways an expanded-by-default
-      // page is a wall of forms. The chevron opens one on demand.
+      // A single gateway opens directly; with several gateways, keep every
+      // card collapsed so the page does not become a wall of forms.
       setExpandedGroups(drafts.length === 1 ? new Set([textOf(drafts[0] ?? {}, 'id')]) : new Set())
       setExpandedModels(new Map())
       setEditing(new Map())

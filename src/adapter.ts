@@ -547,6 +547,7 @@ export class NewApiAdapter extends LlmAdapter {
     const apiKey = request.apiKey !== undefined
       ? assertUsableApiKey(request.apiKey, PKG, 'the draft credential')
       : await this.config.resolveApiKey(connection)
+    const messagesApi = connection.apiType === 'messages'
     let response: Response
     try {
       response = await fetch(`${base}/models`, {
@@ -554,6 +555,7 @@ export class NewApiAdapter extends LlmAdapter {
         headers: {
           'authorization': `Bearer ${apiKey}`,
           'accept': 'application/json',
+          ...(messagesApi ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {}),
           ...attributionHeaders(),
         },
         ...signal === undefined ? {} : { signal },
@@ -600,7 +602,7 @@ export class NewApiAdapter extends LlmAdapter {
       const known = catalog.get(entry.id)
       models.push({
         id: entry.id,
-        name: displayModelName(entry.id, entry.name),
+        name: displayModelName(entry.id, entry.display_name ?? entry.name),
         ...known?.contextWindow !== undefined ? { contextWindow: known.contextWindow } : {},
         ...known?.maxTokens !== undefined ? { maxTokens: known.maxTokens } : {},
       })

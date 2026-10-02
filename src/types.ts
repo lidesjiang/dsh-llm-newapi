@@ -177,6 +177,8 @@ export interface WireModelEntry {
   id: string
   /** Human-readable name when the gateway supplies one. */
   name?: string
+  /** Anthropic Models API display name when Messages headers select that format. */
+  display_name?: string
   /** OpenAI `owned_by` field when present. */
   owned_by?: string
 }

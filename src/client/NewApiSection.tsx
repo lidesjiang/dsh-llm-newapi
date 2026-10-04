@@ -364,6 +364,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
   // Per-group models.dev params panel.
   const [params, setParams] = useState<ReadonlyMap<string, ModelsDevParamsResponse>>(new Map())
   const [paramChoices, setParamChoices] = useState<ReadonlyMap<string, ReadonlyMap<string, number>>>(new Map())
+  const [paramsFeedback, setParamsFeedback] = useState<ReadonlyMap<string, { kind: 'success' | 'error'; text: string }>>(new Map())
   const [paramsBusy, setParamsBusy] = useState(false)
   const [curlOpen, setCurlOpen] = useState<ReadonlySet<number>>(new Set())
   const [curlDrafts, setCurlDrafts] = useState<ReadonlyMap<number, string>>(new Map())
@@ -819,12 +820,18 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     const group = groups.find(g => textOf(g, 'id') === gid)
     const ids = modelsOf(group ?? {}).map(model => textOf(model, 'id').trim()).filter(id => id.length > 0)
     if (ids.length === 0) {
-      setErrorText(t('paramsNoModels'))
+      setParamsFeedback(current => new Map(current).set(gid, { kind: 'error', text: t('paramsNoModels') }))
       return
     }
     const proxy = proxies.get(gid)
     setParamsBusy(true)
     setErrorText(undefined)
+    setNotice(undefined)
+    setParamsFeedback(current => {
+      const next = new Map(current)
+      next.delete(gid)
+      return next
+    })
     setParams(current => new Map(current).set(gid, undefined as never))
     try {
       const response = await props.fetchModelParams({
@@ -833,7 +840,7 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         ...proxy !== undefined && proxy.enabled && proxy.url.trim().length > 0 ? { proxyUrl: proxy.url.trim() } : {},
       })
       if (!response.ok) {
-        setErrorText(response.error.message)
+        setParamsFeedback(current => new Map(current).set(gid, { kind: 'error', text: response.error.message }))
         return
       }
       setParams(current => new Map(current).set(gid, response.value))
@@ -841,14 +848,26 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       setParamChoices(current => new Map(current).set(gid, choices))
       const matched = response.value.models.filter(entry => entry.matches.length > 0).length
       const updated = applyParams(gid, false, response.value, choices, true)
-      setNotice(
-        t('paramsAutoSummary')
-          .replace('{matched}', String(matched))
-          .replace('{updated}', String(updated))
-          .replace('{unmatched}', String(response.value.models.length - matched)),
-      )
+      const summary = t('paramsAutoSummary')
+        .replace('{matched}', String(matched))
+        .replace('{updated}', String(updated))
+        .replace('{unmatched}', String(response.value.models.length - matched))
+      setParamsFeedback(current => new Map(current).set(gid, { kind: 'success', text: summary }))
+      const matchedIds = new Set(response.value.models.filter(entry => entry.matches.length > 0).map(entry => entry.id))
+      const matchedRows = modelsOf(group ?? {}).reduce<number[]>((rows, model, index) => {
+        if (matchedIds.has(textOf(model, 'id').trim())) rows.push(index)
+        return rows
+      }, [])
+      setExpandedModels(current => {
+        const rows = new Set(current.get(gid) ?? new Set<number>())
+        for (const index of matchedRows) rows.add(index)
+        return new Map(current).set(gid, rows)
+      })
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : String(error))
+      setParamsFeedback(current => new Map(current).set(gid, {
+        kind: 'error',
+        text: error instanceof Error ? error.message : String(error),
+      }))
     } finally {
       setParamsBusy(false)
     }
@@ -1122,6 +1141,15 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                                 </button>
                               </div>
                             </div>
+                            {paramsFeedback.get(gid) !== undefined ? (
+                              <p
+                                className={paramsFeedback.get(gid)?.kind === 'error' ? 'newapi-error' : 'newapi-params-summary'}
+                                role={paramsFeedback.get(gid)?.kind === 'error' ? 'alert' : 'status'}
+                                style={{ margin: '4px 0 8px' }}
+                              >
+                                {paramsFeedback.get(gid)?.text}
+                              </p>
+                            ) : null}
                             {groupModels.length === 0 ? <p className="newapi-empty">{t('modelsEmpty')}</p> : null}
                             {groupModels.map((model, mIndex) => {
                               const rowExpanded = (expandedModels.get(gid) ?? new Set<number>()).has(mIndex)

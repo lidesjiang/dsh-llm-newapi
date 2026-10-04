@@ -163,6 +163,8 @@ describe('models.dev params update', () => {
     expect(screen.getByRole('status').textContent).toBe(
       t('paramsAutoSummary').replace('{matched}', '2').replace('{updated}', '2').replace('{unmatched}', '1'),
     )
+    expect((screen.getByLabelText(`${t('contextWindow')} 1`) as HTMLInputElement).value).toBe('128K')
+    expect((screen.getByLabelText(`${t('maxTokens')} 1`) as HTMLInputElement).value).toBe('8192')
     expect(screen.getByText(t('paramsSummary').replace('{matched}', '2').replace('{unmatched}', '1'))).toBeTruthy()
     expect(screen.getByText(t('paramsUnmatched'))).toBeTruthy()
     const picker = screen.getByLabelText(`${t('paramsProvider')} qwen/qwen-max`) as HTMLSelectElement
@@ -179,6 +181,20 @@ describe('models.dev params update', () => {
     expect(models[0]).toEqual({ id: 'deepseek-chat', contextWindow: 128_000, maxTokens: 8_192, reasoningEfforts: ['low', 'medium', 'high'] })
     expect(models[1]).toEqual({ id: 'qwen/qwen-max', contextWindow: 131_072, maxTokens: 32_768 })
     expect(models[2]).toEqual({ id: 'mystery-model' })
+  })
+
+  it('shows lookup failures beside the models.dev action', async () => {
+    const api = wireFace()
+    const fetchModelParams = vi.fn(() => Promise.resolve({
+      ok: false as const,
+      error: { code: 'unavailable', message: 'models.dev is unreachable' },
+    }))
+    render(<NewApiSection api={api as never} t={t} fetchModelParams={fetchModelParams as never} />)
+    await expandFirstGroup()
+
+    fireEvent.click(await waitFor(() => screen.getByText(t('updateParams'))))
+    expect((await screen.findByRole('alert')).textContent).toContain('models.dev is unreachable')
+    expect(fetchModelParams).toHaveBeenCalledTimes(1)
   })
 
   it('fills missing fields automatically while preserving existing values', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-newapi",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "NewAPI gateway adapter for OpenAI Chat Completions, Responses, and Claude Messages APIs in DeepSeek Harness. Configure multiple gateways, discover models, and edit curl examples in the dsh web settings page.",
   "type": "module",
   "main": "lib/index.js",

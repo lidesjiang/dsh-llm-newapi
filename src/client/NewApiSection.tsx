@@ -837,11 +837,14 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         return
       }
       setParams(current => new Map(current).set(gid, response.value))
-      setParamChoices(current => new Map(current).set(gid, new Map()))
+      const choices = new Map<string, number>()
+      setParamChoices(current => new Map(current).set(gid, choices))
       const matched = response.value.models.filter(entry => entry.matches.length > 0).length
+      const updated = applyParams(gid, false, response.value, choices, true)
       setNotice(
-        t('paramsSummary')
+        t('paramsAutoSummary')
           .replace('{matched}', String(matched))
+          .replace('{updated}', String(updated))
           .replace('{unmatched}', String(response.value.models.length - matched)),
       )
     } catch (error) {
@@ -851,20 +854,24 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
     }
   }
 
-  const chosenMatch = (gid: string, entry: { id: string; matches: ModelsDevParamsResponse['models'][number]['matches'] }) =>
-    entry.matches[(paramChoices.get(gid) ?? new Map<string, number>()).get(entry.id) ?? 0] ?? entry.matches[0]
-
-  /** Apply the panel's chosen matches to the rows. */
-  const applyParams = (gid: string, overwrite: boolean): void => {
-    const groupParams = params.get(gid)
-    if (groupParams === undefined) return
+  /** Apply the selected models.dev facts, preserving existing values by default. */
+  const applyParams = (
+    gid: string,
+    overwrite: boolean,
+    groupParams = params.get(gid),
+    choices = paramChoices.get(gid) ?? new Map<string, number>(),
+    keepPreview = false,
+  ): number => {
+    if (groupParams === undefined) return 0
     const byId = new Map(groupParams.models.map(entry => [entry.id, entry]))
     let touched = 0
     const group = groups.find(g => textOf(g, 'id') === gid)
     const next = modelsOf(group ?? {}).map(model => {
       const id = textOf(model, 'id').trim()
       const entry = byId.get(id)
-      const match = entry === undefined || entry.matches.length === 0 ? undefined : chosenMatch(gid, entry)
+      const match = entry === undefined || entry.matches.length === 0
+        ? undefined
+        : entry.matches[choices.get(entry.id) ?? 0] ?? entry.matches[0]
       if (match === undefined) return model
       const nextContext = match.contextWindow
       const nextMax = match.maxTokens
@@ -886,10 +893,13 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
         ...takeVision ? { vision: true } : {},
       }
     })
-    patchGroup(groups.findIndex(g => textOf(g, 'id') === gid), { models: next })
-    setParams(current => new Map(current).set(gid, undefined as never))
-    setParamChoices(current => new Map(current).set(gid, new Map()))
-    setNotice(`${t('paramsApplied')} (${String(touched)})`)
+    if (touched > 0) patchGroup(groups.findIndex(g => textOf(g, 'id') === gid), { models: next })
+    if (!keepPreview) {
+      setParams(current => new Map(current).set(gid, undefined as never))
+      setParamChoices(current => new Map(current).set(gid, new Map()))
+      setNotice(`${t('paramsApplied')} (${String(touched)})`)
+    }
+    return touched
   }
 
   if (status === 'loading') return <section aria-label={t('nav')}><p>…</p></section>
@@ -1333,11 +1343,8 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
                           <button type="button" className="newapi-button newapi-button--primary" onClick={() => { applyParams(gid, true) }}>
                             {t('paramsOverwrite')}
                           </button>
-                          <button type="button" className="newapi-button" onClick={() => { applyParams(gid, false) }}>
-                            {t('paramsFillBlank')}
-                          </button>
                           <button type="button" className="newapi-button" onClick={() => { setParams(current => new Map(current).set(gid, undefined as never)); setParamChoices(current => new Map(current).set(gid, new Map())) }}>
-                            {t('fetchCancel')}
+                            {t('paramsClose')}
                           </button>
                         </div>
                       </div>

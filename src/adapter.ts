@@ -242,6 +242,13 @@ export const DEFAULT_PROVIDER_HINTS: Readonly<ProviderHints> = {
   },
 }
 
+/** Current models.dev ids for gateway aliases that still identify the same model. */
+const MODELS_DEV_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  // DeepSeek names V4.1 Flash `deepseek-flash`; gateways may still expose the
+  // descriptive model id `deepseek-v4.1-flash`.
+  'deepseek-v4.1-flash': 'deepseek-flash',
+}
+
 /** The provider a hint names for one gateway id, if any. */
 function hintedProvider(id: string, bare: string, hints?: ProviderHints): string | undefined {
   const exact = hints?.models?.[id] ?? hints?.models?.[bare]
@@ -270,7 +277,8 @@ function hintedProvider(id: string, bare: string, hints?: ProviderHints): string
  */
 export function matchModelsDev(api: ModelsDevApi, id: string, hints?: ProviderHints): ModelsDevMatch[] {
   const bare = id.slice(id.lastIndexOf('/') + 1)
-  const keys = new Set<string>([id, bare])
+  const alias = MODELS_DEV_MODEL_ALIASES[bare.toLowerCase()]
+  const keys = new Set<string>([id, bare, ...(alias === undefined ? [] : [alias])])
   const hinted = hintedProvider(id, bare, hints)
   const exact = new Map<string, ModelsDevMatch>()
   const near = new Map<string, ModelsDevMatch>()

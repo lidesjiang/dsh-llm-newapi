@@ -224,6 +224,14 @@ function stubModelsListing() {
     digitalocean: { models: { 'mimo-v2.5-pro': { limit: { context: 131072, output: 32768 } } } },
     empty: {},
   }
+  const deepseekFlash = plugin.matchModelsDev({
+    deepseek: { models: { 'deepseek-flash': { name: 'DeepSeek V4.1 Flash', limit: { context: 1_048_576, output: 393_216 }, modalities: { input: ['text', 'image'], output: ['text'] } } } },
+  }, 'deepseek-v4.1-flash')
+  assert.equal(deepseekFlash.length, 1)
+  assert.equal(deepseekFlash[0].provider, 'deepseek')
+  assert.equal(deepseekFlash[0].contextWindow, 1_048_576)
+  assert.equal(deepseekFlash[0].maxTokens, 393_216)
+  assert.equal(deepseekFlash[0].vision, true)
   // qwen-max: the built-in qwen→alibaba hint leads with the official
   // vendor's entry; qwen's own catalog entry follows in exact-key order.
   const qwenMatches = plugin.matchModelsDev(api, 'qwen/qwen-max')

@@ -25,6 +25,7 @@ import {
 import type { LlmConfigurableProvider, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { clientRequestSchema } from '@deepseek-ai/dsh-client-connection'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 // Type-only: pulls the cordis Context augmentation declaring ctx.settings
@@ -520,31 +521,58 @@ export function apply(ctx: Context, config: Config): void {
   // Model discovery: interrogate the gateway's /models with the draft endpoint.
   ctx.llm.registerModelDiscovery(NS, (request, signal) => adapter.discoverModels(request, signal))
 
-  // RPC channel for models-dev-params.
+  // models.dev lookup rides the shared authenticated /api transport. A
+  // feature-owned exact Fetch route remains available even when the web
+  // server does not mount standalone RPC channel prefixes.
   ctx.inject(['connection'], (cctx) => {
     const connection = cctx.get('connection') as HostConnectionHandle
-    cctx.effect(() => connection.rpc.handle(
-      '/llm-newapi',
-      (endpoint: string, payload: unknown, signal: AbortSignal) => {
-        if (endpoint !== 'models-dev-params') {
-          return Promise.resolve({
-            ok: false as const,
-            error: { code: 'internal' as const, message: `llm-newapi: unknown endpoint ${endpoint}`, details: {} },
+    cctx.effect(() => connection.fetch.register({
+      path: '/api/llm-newapi/models-dev-params',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (httpRequest) => {
+        let raw: unknown
+        try {
+          raw = await httpRequest.json()
+        } catch {
+          return Response.json({ error: 'Invalid JSON request body' }, { status: 400 })
+        }
+
+        const parsed = clientRequestSchema.safeParse(raw)
+        if (!parsed.success) return Response.json({ error: 'Invalid RPC request envelope' }, { status: 400 })
+
+        const { rpcId, method, payload } = parsed.data
+        const reply = (result: { ok: true; value: unknown } | { ok: false; error: { code: string; message: string; details: Record<string, unknown> } }): Response =>
+          Response.json({ type: 'server-response', rpcId, result })
+
+        if (method !== 'llm-newapi/models-dev-params') {
+          return reply({
+            ok: false,
+            error: { code: 'gateway/bad-request', message: `Unexpected RPC method ${method}`, details: {} },
           })
         }
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+          return reply({ ok: false, error: { code: 'gateway/bad-request', message: 'Invalid models.dev lookup request', details: {} } })
+        }
         const request = payload as ModelsDevParamsRequest
-        return adapter.fetchModelsDevParams(request, signal)
-          .then(value => ({ ok: true as const, value }))
-          .catch((error: unknown) => ({
-            ok: false as const,
+        if (!Array.isArray(request.modelIds) || request.modelIds.some(id => typeof id !== 'string')) {
+          return reply({ ok: false, error: { code: 'gateway/bad-request', message: 'models.dev lookup requires modelIds to be a string array', details: {} } })
+        }
+        try {
+          const value = await adapter.fetchModelsDevParams(request, httpRequest.signal)
+          return reply({ ok: true, value })
+        } catch (error) {
+          return reply({
+            ok: false,
             error: {
-              code: 'internal' as const,
+              code: 'internal',
               message: error instanceof Error ? error.message : String(error),
               details: {},
             },
-          }))
+          })
+        }
       },
-    ), 'llm-newapi: models-dev RPC channel')
+    }), 'llm-newapi: models-dev API route')
   })
 
   // Initial sync + settings form policy. Config fields marked volatile above

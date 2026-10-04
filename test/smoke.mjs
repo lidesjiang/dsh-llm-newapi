@@ -35,6 +35,22 @@ async function mountPlugin(ctx, config = {}) {
   }, config)
 }
 
+/** Exercise a JSON RPC call at the exact path under Connection's /api carrier. */
+async function callSharedApiRoute(route, endpoint, payload, rpcId) {
+  const input = `api/${endpoint}`
+  const url = new URL(input, 'http://dsh.local/')
+  assert.equal(url.pathname, `/api/${endpoint}`)
+  const response = await route.fetch(new Request(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId, method: endpoint, payload }),
+  }))
+  const full = await response.json()
+  assert.equal(full.type, 'server-response')
+  assert.equal(full.rpcId, rpcId)
+  return full.result
+}
+
 /** Stub fetch to answer a models listing and record the request. */
 function stubModelsListing() {
   const originalFetch = globalThis.fetch
@@ -303,7 +319,7 @@ function stubModelsListing() {
   )
 }
 
-// ── Block E: the models-dev RPC channel registers once connection starts ──
+// ── Block E: the models.dev route mounts on the shared authenticated API ──
 {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -314,10 +330,10 @@ function stubModelsListing() {
   const registered = []
   class FakeConnection extends Service {
     constructor(child) { super(child, 'connection') }
-    get rpc() {
+    get fetch() {
       return {
-        handle: (channel, handler) => {
-          registered.push({ channel, handler })
+        register: (route) => {
+          registered.push(route)
           return () => Promise.resolve()
         },
       }
@@ -325,14 +341,11 @@ function stubModelsListing() {
   }
   await ctx.plugin(FakeConnection)
 
-  // The inject scope ran as soon as the service appeared.
+  // The inject scope ran as soon as the service appeared and uses the
+  // existing authenticated /api carrier instead of an unmounted top-level path.
   assert.equal(registered.length, 1)
-  assert.equal(registered[0].channel, '/llm-newapi')
-
-  // Unknown endpoints answer the error envelope without any network use.
-  const answer = await registered[0].handler('nope', {}, new AbortController().signal)
-  assert.equal(answer.ok, false)
-  assert.match(answer.error.message, /unknown endpoint nope/)
+  assert.equal(registered[0].path, '/api/llm-newapi/models-dev-params')
+  assert.deepEqual(registered[0].methods, ['POST'])
 
   // A failing catalog download answers the error envelope too — a thrown
   // handler would surface as an opaque HTTP 500 at the transport.
@@ -340,7 +353,7 @@ function stubModelsListing() {
   globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause: new Error('connect ENETUNREACH') }) }
   let failure
   try {
-    failure = await registered[0].handler('models-dev-params', { modelIds: ['x'] }, new AbortController().signal)
+    failure = await callSharedApiRoute(registered[0], 'llm-newapi/models-dev-params', { modelIds: ['x'] }, 'rpc-e')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -373,13 +386,13 @@ function stubModelsListing() {
   await ctx.plugin({ inject: ['llm'], apply: (c) => { c.llm.registerAdapter(['zeta'], officialAdapter) } })
   await mountPlugin(ctx)
 
-  const channels = []
+  const routes = []
   class FakeConnectionH extends Service {
     constructor(child) { super(child, 'connection') }
-    get rpc() {
+    get fetch() {
       return {
-        handle: (channel, handler) => {
-          channels.push(handler)
+        register: (route) => {
+          routes.push(route)
           return () => Promise.resolve()
         },
       }
@@ -394,7 +407,7 @@ function stubModelsListing() {
   }), { status: 200, headers: { 'content-type': 'application/json' } })
   let answer
   try {
-    answer = await channels[0]('models-dev-params', { modelIds: ['gwmax-1'] }, new AbortController().signal)
+    answer = await callSharedApiRoute(routes[0], 'llm-newapi/models-dev-params', { modelIds: ['gwmax-1'] }, 'rpc-h')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -624,4 +637,4 @@ function stubModelsListing() {
   }
 }
 
-console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, config validation, ordering, display names, models.dev matching, deferred RPC channel, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')
+console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, config validation, ordering, display names, models.dev matching over the shared authenticated API, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')

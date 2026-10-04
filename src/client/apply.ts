@@ -275,11 +275,10 @@ export function apply(ctx: Context): void {
   const connection = ctx.get('connection') as ConnectionHandle
   const t = ctx.locale.bind(NS) as (key: NewApiKey) => string
 
-  // One plain callback over the plugin's host RPC channel: the browser names
-  // the gateway model ids (and the proxy draft) and the host downloads
-  // https://models.dev/api.json — no cross-origin fetch in the browser.
+  // Use the shared /api transport: the browser names the gateway model ids
+  // (and the proxy draft) and the host downloads https://models.dev/api.json.
   const fetchModelParams = (request: ModelsDevParamsRequest) =>
-    connection.rpc.call('/llm-newapi', 'models-dev-params', request) as Promise<
+    connection.rpc.call('/api', 'llm-newapi/models-dev-params', request) as Promise<
       { ok: true; value: ModelsDevParamsResponse } | { ok: false; error: { message: string } }
     >
 

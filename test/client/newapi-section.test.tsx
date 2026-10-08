@@ -133,6 +133,44 @@ describe('environment-supplied credential (read-only)', () => {
   })
 })
 
+describe('group credential updates', () => {
+  it('stores the group key before publishing a live gateway route', async () => {
+    const api = wireFace({
+      describeAnswer: {
+        writable: true,
+        hasDocument: true,
+        namespaces: [{
+          ns: 'llm-newapi',
+          schema: {},
+          value: {
+            groups: [{
+              id: 'SH',
+              name: 'SHAILAB',
+              baseURL: 'http://ailab.local/v1',
+              models: [{ id: 'example-model' }],
+            }],
+          },
+          applies: 'live',
+          secrets: [],
+          revision: 7,
+        }],
+      },
+      credentialsAnswer: { newapi_SH: { configured: false, writable: true } },
+    })
+    render(<NewApiSection api={api as never} t={t} />)
+    await expandFirstGroup()
+
+    fireEvent.change(screen.getByLabelText(`${t('keyInput')} 1`), { target: { value: 'rotated-test-key' } })
+    fireEvent.click(screen.getByText(t('apply')))
+
+    await waitFor(() => { expect(screen.getByText(t('saved'))).toBeTruthy() })
+    expect(api.credentials.set).toHaveBeenCalledWith('newapi_SH', 'rotated-test-key')
+    expect(api.credentials.set.mock.invocationCallOrder[0]).toBeLessThan(
+      api.settings.mutate.mock.invocationCallOrder[0],
+    )
+  })
+})
+
 describe('models.dev params update', () => {
   function groupsValue(models: unknown[]) {
     return {

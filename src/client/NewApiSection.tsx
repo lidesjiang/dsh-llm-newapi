@@ -523,13 +523,9 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
       ops.push({ op: 'set', path: ['groups'], value: serializedGroups })
       ops.push({ op: 'unset', path: ['baseURL'] })
       ops.push({ op: 'unset', path: ['models'] })
-      const mutated = await api.settings.mutate(NS, ops, revision)
-      if (!mutated.ok) {
-        setErrorText(mutated.error.message)
-        return
-      }
-      setRevision(mutated.value.revision)
-      // Write each non-empty key draft to its group's credential ref.
+      // Persist key changes before publishing group changes. The host applies
+      // settings live, so publishing a new/changed route first could let a
+      // request resolve that route before its credential exists.
       for (const [ref, draft] of Object.entries(sourceKeyDrafts)) {
         const key = draft.trim()
         if (key.length === 0) continue
@@ -539,6 +535,12 @@ export function NewApiSection(props: NewApiSectionProps): ReactNode {
           return
         }
       }
+      const mutated = await api.settings.mutate(NS, ops, revision)
+      if (!mutated.ok) {
+        setErrorText(mutated.error.message)
+        return
+      }
+      setRevision(mutated.value.revision)
       setKeyDrafts({})
       setCurlDrafts(new Map())
       saved(t('saved'))

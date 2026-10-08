@@ -74,6 +74,230 @@ function closeBlock(block: OpenBlock): ContentBlock {
   }
 }
 
+const DSML_PREFIXES = ['<|DSML|', '<｜DSML｜', '</|DSML|', '</｜DSML｜'] as const
+const THINK_CLOSE = '</think>'
+
+interface DsmlTag {
+  attributes: string
+  closing: boolean
+  selfClosing: boolean
+  name: string
+}
+
+function parseDsmlTag(value: string): DsmlTag | undefined {
+  const match = /^<(\/?)\s*(?:\||｜)DSML(?:\||｜)([A-Za-z][\w-]*)([^>]*)>$/u.exec(value)
+  if (!match) return undefined
+  const attributes = match[3] ?? ''
+  return {
+    closing: match[1] === '/',
+    name: match[2]!,
+    selfClosing: !match[1] && /\/\s*$/.test(attributes),
+    attributes: attributes.replace(/\/\s*$/, ''),
+  }
+}
+
+function dsmlAttribute(attributes: string, name: string): string | undefined {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(`(?:^|\\s)${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'u').exec(attributes)
+  return match?.[1] ?? match?.[2] ?? match?.[3]
+}
+
+interface DsmlInvocation {
+  name: string
+  arguments: string
+}
+
+type DsmlSegment = { type: 'text'; text: string } | { type: 'tool-call'; invocation: DsmlInvocation }
+
+function parseDsmlArguments(body: string): string | undefined {
+  const parameterPattern = /<(?:\||｜)DSML(?:\||｜)parameter\b([^>]*)>([\s\S]*?)<\/(?:\||｜)DSML(?:\||｜)parameter\s*>/gu
+  const parameters = [...body.matchAll(parameterPattern)].map(match => ({
+    name: dsmlAttribute(match[1] ?? '', 'name'),
+    string: dsmlAttribute(match[1] ?? '', 'string') !== 'false',
+    value: match[2] ?? '',
+  })).filter((parameter): parameter is typeof parameter & { name: string } => Boolean(parameter.name))
+
+  const argumentParameter = parameters.find(parameter => parameter.name === 'arguments')
+  if (argumentParameter) {
+    const value = argumentParameter.value.trim()
+    if (value.length === 0) return '{}'
+    if (!argumentParameter.string) {
+      try {
+        return JSON.stringify(JSON.parse(value))
+      } catch {
+        return undefined
+      }
+    }
+    try {
+      JSON.parse(value)
+      return value
+    } catch {
+      return JSON.stringify(argumentParameter.value)
+    }
+  }
+
+  const values: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+  for (const parameter of parameters) {
+    if (parameter.string) {
+      values[parameter.name] = parameter.value
+      continue
+    }
+    try {
+      values[parameter.name] = JSON.parse(parameter.value.trim()) as unknown
+    } catch {
+      return undefined
+    }
+  }
+  return JSON.stringify(values) ?? '{}'
+}
+
+function parseDsmlInvocations(block: string): DsmlInvocation[] {
+  const invocationPattern = /<(?:\||｜)DSML(?:\||｜)invoke\b([^>]*)>([\s\S]*?)<\/(?:\||｜)DSML(?:\||｜)invoke\s*>/gu
+  const invocations: DsmlInvocation[] = []
+  for (const match of block.matchAll(invocationPattern)) {
+    const name = dsmlAttribute(match[1] ?? '', 'name')
+    const argumentsText = parseDsmlArguments(match[2] ?? '')
+    if (name && argumentsText !== undefined) invocations.push({ name, arguments: argumentsText })
+  }
+  return invocations
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function toolCallSignature(name: string, argumentsText: string): string {
+  try {
+    return `${name}\u0000${canonicalJson(JSON.parse(argumentsText) as unknown)}`
+  } catch {
+    return `${name}\u0000${argumentsText.trim()}`
+  }
+}
+
+function longestSuffixPrefix(value: string, prefixes: readonly string[]): number {
+  let longest = 0
+  for (const prefix of prefixes) {
+    const maximum = Math.min(value.length, prefix.length)
+    for (let length = maximum; length > longest; length--) {
+      if (prefix.startsWith(value.slice(-length))) {
+        longest = length
+        break
+      }
+    }
+  }
+  return longest
+}
+
+/**
+ * Parse DSML tool calls from assistant content while preserving surrounding
+ * prose. Possible marker prefixes and complete invocations are buffered across
+ * SSE deltas so protocol text is never exposed as ordinary assistant text.
+ */
+class DsmlContentParser {
+  private pending = ''
+
+  push(fragment: string): DsmlSegment[] {
+    this.pending += fragment
+    const output: DsmlSegment[] = []
+
+    while (this.pending.length > 0) {
+      const marker = this.findMarker(this.pending)
+      if (!marker) {
+        const partialMarker = longestSuffixPrefix(this.pending, DSML_PREFIXES)
+        const beforePartialMarker = this.pending.slice(0, this.pending.length - partialMarker)
+        const adjacentThink = /\s*<\/think>\s*$/u.exec(beforePartialMarker)
+        const hold = Math.max(
+          partialMarker + (adjacentThink ? beforePartialMarker.length - adjacentThink.index : 0),
+          longestSuffixPrefix(this.pending, [THINK_CLOSE]),
+          /\s*<\/think>\s*$/u.exec(this.pending)?.[0].length ?? 0,
+        )
+        this.pushText(output, this.pending.slice(0, this.pending.length - hold))
+        this.pending = hold > 0 ? this.pending.slice(-hold) : ''
+        break
+      }
+
+      const precedingText = this.pending.slice(0, marker.index).replace(/\s*<\/think>\s*$/u, '')
+      this.pushText(output, precedingText)
+      this.pending = this.pending.slice(marker.index)
+
+      const extracted = this.extractBlock()
+      if (!extracted) break
+      this.pending = this.pending.slice(extracted.end)
+      for (const invocation of parseDsmlInvocations(extracted.raw)) {
+        output.push({ type: 'tool-call', invocation })
+      }
+    }
+
+    return output
+  }
+
+  finish(): DsmlSegment[] {
+    // An incomplete DSML call is not executable and must not leak as text.
+    if (this.findMarker(this.pending)) {
+      this.pending = ''
+      return []
+    }
+    const partialMarker = longestSuffixPrefix(this.pending, DSML_PREFIXES)
+    let tail = this.pending.slice(0, this.pending.length - partialMarker)
+    if (partialMarker > 0) tail = tail.replace(/\s*<\/think>\s*$/u, '')
+    this.pending = ''
+    return tail.length > 0 ? [{ type: 'text', text: tail }] : []
+  }
+
+  private findMarker(value: string, startIndex = 0): { index: number; prefix: string } | undefined {
+    let result: { index: number; prefix: string } | undefined
+    for (const prefix of DSML_PREFIXES) {
+      const index = value.indexOf(prefix, startIndex)
+      if (index >= 0 && (result === undefined || index < result.index)) result = { index, prefix }
+    }
+    return result
+  }
+
+  private extractBlock(): { end: number; raw: string } | undefined {
+    const stack: string[] = []
+    let cursor = 0
+    let sawOpening = false
+
+    while (cursor < this.pending.length) {
+      const marker = this.findMarker(this.pending, cursor)
+      if (!marker) return undefined
+      const tagEnd = this.pending.indexOf('>', marker.index + marker.prefix.length)
+      if (tagEnd < 0) return undefined
+      const tag = parseDsmlTag(this.pending.slice(marker.index, tagEnd + 1))
+      cursor = tagEnd + 1
+      if (!tag) continue
+
+      if (tag.closing) {
+        const matchIndex = stack.lastIndexOf(tag.name)
+        if (matchIndex >= 0) {
+          stack.length = matchIndex
+          if (stack.length === 0) return { end: tagEnd + 1, raw: this.pending.slice(0, tagEnd + 1) }
+        } else if (!sawOpening) {
+          return { end: tagEnd + 1, raw: this.pending.slice(0, tagEnd + 1) }
+        }
+      } else {
+        sawOpening = true
+        if (tag.selfClosing) {
+          if (stack.length === 0) return { end: tagEnd + 1, raw: this.pending.slice(0, tagEnd + 1) }
+        } else {
+          stack.push(tag.name)
+        }
+      }
+    }
+
+    return undefined
+  }
+
+  private pushText(output: DsmlSegment[], text: string): void {
+    if (text.length > 0) output.push({ type: 'text', text })
+  }
+}
+
 /**
  * Consume SSE data payloads (ending with `[DONE]`) and yield StreamChunks.
  * Malformed JSON payloads abort the stream with `MALFORMED_RESPONSE`.
@@ -88,6 +312,9 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
   let reasoningBlock: OpenBlock | undefined
   const toolBlocks = new Map<number, OpenBlock>()
   const order: OpenBlock[] = []
+  const dsmlParser = new DsmlContentParser()
+  const dsmlCalls: DsmlInvocation[] = []
+  let nextDsmlCallId = 0
   let pendingFinish: FinishReason | undefined
   let pendingUsage: TokenUsage | undefined
 
@@ -99,19 +326,56 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
 
   for await (const payload of payloads) {
     if (payload === DONE) {
+      for (const segment of dsmlParser.finish()) {
+        if (segment.type === 'text') {
+          if (!textBlock) {
+            textBlock = open('text')
+            yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+          }
+          textBlock.text += segment.text
+          yield { type: 'text-delta', index: textBlock.index, text: segment.text }
+        } else {
+          dsmlCalls.push(segment.invocation)
+        }
+      }
+
+      const structuredCalls = new Set([...toolBlocks.values()]
+        .filter(block => block.name !== undefined)
+        .map(block => toolCallSignature(block.name!, block.text)))
+      let emittedDsmlCalls = 0
+      for (const invocation of dsmlCalls) {
+        if (structuredCalls.has(toolCallSignature(invocation.name, invocation.arguments))) continue
+        const block = open('tool-call')
+        block.callId = `dsml-${++nextDsmlCallId}`
+        block.name = invocation.name
+        block.text = invocation.arguments
+        yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+        yield {
+          type: 'tool-call-delta',
+          index: block.index,
+          id: ToolCallId(block.callId),
+          name: block.name,
+          argumentsDelta: block.text,
+        }
+        emittedDsmlCalls++
+      }
+
       for (const block of order) {
         yield { type: 'block-end', index: block.index, block: closeBlock(block) }
       }
       if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
       const reason = pendingFinish ?? { kind: 'stop' as const }
+      const finalReason = (toolBlocks.size > 0 || emittedDsmlCalls > 0) && reason.kind === 'stop'
+        ? { kind: 'tool-calls' as const }
+        : reason
       yield {
         type: 'finish',
-        reason: reason.kind === 'stop' && order.length === 0
+        reason: finalReason.kind === 'stop' && order.length === 0
           ? {
             kind: 'error',
             failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
           }
-          : reason,
+          : finalReason,
       }
       return
     }
@@ -140,12 +404,18 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
 
       const content = delta?.content
       if (typeof content === 'string' && content.length > 0) {
-        if (!textBlock) {
-          textBlock = open('text')
-          yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+        for (const segment of dsmlParser.push(content)) {
+          if (segment.type === 'text') {
+            if (!textBlock) {
+              textBlock = open('text')
+              yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+            }
+            textBlock.text += segment.text
+            yield { type: 'text-delta', index: textBlock.index, text: segment.text }
+          } else {
+            dsmlCalls.push(segment.invocation)
+          }
         }
-        textBlock.text += content
-        yield { type: 'text-delta', index: textBlock.index, text: content }
       }
 
       for (const call of delta?.tool_calls ?? []) {

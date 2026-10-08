@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { Context, Service } from '@deepseek-ai/cordis'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import LlmRuntime, { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
 
@@ -116,6 +117,42 @@ function stubModelsListing() {
   await fiber.dispose()
   assert.deepEqual(ctx.llm.listProviders(), [])
   assert.deepEqual(ctx.llm.listConfigurableProviders(), [])
+}
+
+// ── Block A2: live gateway group updates refresh provider routes ──
+{
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  const fiber = await mountPlugin(ctx, {
+    groups: [{ id: 'ginka', name: 'Ginka', baseURL: 'http://ginka.local/v1' }],
+  })
+  const groupsRef = fiber.config.groups
+  const publishGroups = (groups) => {
+    updateVolatile(groupsRef, createVolatile(groups))
+    fiber.ctx.emit('loader/volatile-update', [['groups']])
+  }
+
+  publishGroups([
+    { id: 'ginka', name: 'Ginka', baseURL: 'http://ginka.local/v1' },
+    { id: 'ailab', name: 'AILAB', baseURL: 'http://ailab.local/v1' },
+  ])
+  assert.deepEqual(ctx.llm.listProviders().map(provider => provider.id), ['newapi-ginka', 'newapi-ailab'])
+  assert.deepEqual(ctx.llm.listConfigurableProviders().map(entry => entry.displayName), ['Ginka', 'AILAB'])
+  assert.deepEqual(ctx.llm.listConfigurableProviders()[1].settingsPath, ['groups', '1'])
+
+  publishGroups([
+    { id: 'ginka', name: 'Ginka', baseURL: 'http://ginka.local/v1' },
+    { id: 'ailab-v2', name: 'AILAB Updated', baseURL: 'http://ailab.local/v1' },
+  ])
+  assert.deepEqual(ctx.llm.listProviders().map(provider => provider.id), ['newapi-ginka', 'newapi-ailab-v2'])
+  assert.deepEqual(ctx.llm.listConfigurableProviders().map(entry => entry.displayName), ['Ginka', 'AILAB Updated'])
+
+  publishGroups([
+    { id: 'ginka', name: 'Ginka', baseURL: 'http://ginka.local/v1' },
+  ])
+  assert.deepEqual(ctx.llm.listProviders().map(provider => provider.id), ['newapi-ginka'])
+  assert.deepEqual(ctx.llm.listConfigurableProviders().map(entry => entry.provider), ['newapi-ginka'])
+  await fiber.dispose()
 }
 
 // ── Block B: the API key comes from the credentials service only ──
@@ -511,6 +548,106 @@ function stubModelsListing() {
   assert.equal(chunks.at(-1).reason.kind, 'tool-calls')
 }
 
+// ── Block H: DSML content calls become native tool-call chunks ──
+// Some compatible gateways leave DeepSeek's DSML invocation markup in
+// delta.content instead of returning structured delta.tool_calls. The parser
+// buffers split tags, strips the adjacent </think>, and preserves prose.
+{
+  const adapter = new plugin.NewApiAdapter({
+    options: () => ({
+      baseURL: 'http://gw.local:3000/v1',
+      apiKeyRef: 'newapi',
+      models: [],
+      modelExcludePatterns: [],
+      defaultContextWindow: 128_000,
+      streamIdleTimeoutMs: 300_000,
+      retryPolicy: resolveRetryPolicy(undefined, 'smoke'),
+    }),
+    resolveApiKey: async () => 'smoke-key',
+  })
+  const payloads = [
+    { choices: [{ delta: { content: 'Before </think><｜DS' } }] },
+    { choices: [{ delta: { content: 'ML｜tool_calls><｜DSML｜invoke name="run_code">' } }] },
+    { choices: [{ delta: { content: '<｜DSML｜parameter name="arguments" string="false">{"code":"print(1)"}' } }] },
+    { choices: [{ delta: { content: '</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls> after' } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }] },
+  ]
+  const sse = [
+    ...payloads.map(payload => `data: ${JSON.stringify(payload)}\n\n`),
+    'data: [DONE]\n\n',
+  ].join('')
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  let chunks
+  try {
+    chunks = []
+    for await (const chunk of adapter.stream({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'run a tool' }] }],
+    })) chunks.push(chunk)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  const text = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text).join('')
+  assert.equal(text, 'Before after')
+  assert.ok(!text.includes('DSML'))
+  assert.ok(!text.includes('</think>'))
+  const toolDeltas = chunks.filter(chunk => chunk.type === 'tool-call-delta')
+  assert.equal(toolDeltas.length, 1)
+  assert.equal(toolDeltas[0].name, 'run_code')
+  assert.equal(toolDeltas[0].argumentsDelta, '{"code":"print(1)"}')
+  const toolBlocks = chunks.filter(chunk => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+  assert.equal(toolBlocks.length, 1)
+  assert.equal(toolBlocks[0].block.name, 'run_code')
+  assert.equal(toolBlocks[0].block.arguments, '{"code":"print(1)"}')
+  assert.equal(chunks.at(-1).reason.kind, 'tool-calls')
+}
+
+// ASCII-pipe DSML also parses; if the same call is already present in the
+// standard OpenAI field, only the native structured call is emitted.
+{
+  const adapter = new plugin.NewApiAdapter({
+    options: () => ({
+      baseURL: 'http://gw.local:3000/v1',
+      apiKeyRef: 'newapi',
+      models: [],
+      modelExcludePatterns: [],
+      defaultContextWindow: 128_000,
+      streamIdleTimeoutMs: 300_000,
+      retryPolicy: resolveRetryPolicy(undefined, 'smoke'),
+    }),
+    resolveApiKey: async () => 'smoke-key',
+  })
+  const dsml = '<|DSML|tool_calls><|DSML|invoke name="run_code"><|DSML|parameter name="arguments" string="false">{"code":"print(2)"}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
+  const payloads = [
+    { choices: [{ delta: { content: dsml } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'native-call', type: 'function', function: { name: 'run_code', arguments: '{"code":"print(2)"}' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }] },
+  ]
+  const sse = [
+    ...payloads.map(payload => `data: ${JSON.stringify(payload)}\n\n`),
+    'data: [DONE]\n\n',
+  ].join('')
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  let chunks
+  try {
+    chunks = []
+    for await (const chunk of adapter.stream({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'run a tool' }] }],
+    })) chunks.push(chunk)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  const toolDeltas = chunks.filter(chunk => chunk.type === 'tool-call-delta')
+  assert.equal(toolDeltas.length, 1)
+  assert.equal(toolDeltas[0].id, 'native-call')
+  assert.equal(chunks.at(-1).reason.kind, 'tool-calls')
+}
+
 // ── Block I: the Responses API group type ──
 // A group whose apiType is 'responses' serializes the OpenAI Responses-API
 // shape, posts to {baseURL}/responses, and translates Responses-API SSE
@@ -637,4 +774,4 @@ function stubModelsListing() {
   }
 }
 
-console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, config validation, ordering, display names, models.dev matching over the shared authenticated API, dead-proxy diagnostics, empty-string tool-call delta hardening, and Responses-API adapter path OK')
+console.log('smoke: llm-newapi registrations, chat-only discovery, credentials-service key, config validation, ordering, display names, models.dev matching over the shared authenticated API, dead-proxy diagnostics, empty-string tool-call delta hardening, DSML tool-call translation, and Responses-API adapter path OK')

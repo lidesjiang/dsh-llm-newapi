@@ -15,6 +15,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { isVolatile } from '@deepseek-ai/cosmokit'
+// Declares the Loader's owner-scoped event for live volatile config commits.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import {
   assertUsableApiKey,
   LlmError,
@@ -517,6 +519,15 @@ export function apply(ctx: Context, config: Config): void {
     directory.replace(entries)
     registration.replace(groups.map(g => g.provider))
   }
+
+  // SettingsForms commits volatile config into the running plugin fiber and
+  // the Loader emits this event after the new snapshot is available. Group
+  // routes are registered separately from their live connection options, so
+  // refresh the provider directory and adapter routes whenever the group list
+  // changes without remounting the plugin.
+  ctx.on('loader/volatile-update', (paths) => {
+    if (paths.some(path => path[0] === 'groups')) syncProviders()
+  })
 
   // Model discovery: interrogate the gateway's /models with the draft endpoint.
   ctx.llm.registerModelDiscovery(NS, (request, signal) => adapter.discoverModels(request, signal))
